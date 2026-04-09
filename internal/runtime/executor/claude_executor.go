@@ -1361,6 +1361,11 @@ func buildClaudeTextSystemBlock(text string) string {
 	return string(block)
 }
 
+func buildClaudeTextSystemBlockWithCache(text, scope string) string {
+	quoted, _ := json.Marshal(text)
+	return fmt.Sprintf(`{"type":"text","text":%s,"cache_control":{"type":"ephemeral","scope":"%s"}}`, quoted, scope)
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
@@ -1421,14 +1426,14 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	}
 
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
-	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
+	billingBlock := buildClaudeTextSystemBlock(billingText)
 
 	// Build system blocks matching real Claude Code structure.
 	// Cache control scopes: 'org' for agent block, 'global' for core prompt.
-	agentBlock := fmt.Sprintf(`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral","scope":"org"}}`)
-	introBlock := fmt.Sprintf(`{"type":"text","text":"%s","cache_control":{"type":"ephemeral","scope":"global"}}`, claudeCodeIntro)
-	systemBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, claudeCodeSystem)
-	doingTasksBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, claudeCodeDoingTasks)
+	agentBlock := buildClaudeTextSystemBlockWithCache("You are Claude Code, Anthropic's official CLI for Claude.", "org")
+	introBlock := buildClaudeTextSystemBlockWithCache(claudeCodeIntro, "global")
+	systemBlock := buildClaudeTextSystemBlock(claudeCodeSystem)
+	doingTasksBlock := buildClaudeTextSystemBlock(claudeCodeDoingTasks)
 
 	systemResult := "[" + billingBlock + "," + agentBlock + "," + introBlock + "," + systemBlock + "," + doingTasksBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
