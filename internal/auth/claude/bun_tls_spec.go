@@ -52,9 +52,6 @@ func BunBoringSSLSpec() *tls.ClientHelloSpec {
 			// 0 - Server Name Indication
 			&tls.SNIExtension{},
 
-			// 65037 - Encrypted Client Hello (BoringSSL-specific)
-			&tls.GenericExtension{Id: 65037},
-
 			// 23 - Extended Master Secret
 			&tls.ExtendedMasterSecretExtension{},
 
