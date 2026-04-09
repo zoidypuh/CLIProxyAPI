@@ -1949,7 +1949,6 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	}
 }
 
-<<<<<<< ours
 func TestCheckSystemInstructionsWithMode_UsesConfiguredClaudeVersion(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 	cfg := &config.Config{
