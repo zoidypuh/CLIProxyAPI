@@ -50,8 +50,8 @@ type ClaudeAuth struct {
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
-// It initializes the HTTP client with a custom TLS transport that uses Firefox
-// fingerprint to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// It initializes the HTTP client with a custom TLS transport that uses Bun BoringSSL
+// fingerprint to match real Claude Code CLI behavior.
 //
 // Parameters:
 //   - cfg: The application configuration containing proxy settings
@@ -66,23 +66,14 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
-	var sdkCfg *config.SDKConfig
 	if cfg != nil {
-		sdkCfgCopy := cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
-		sdkCfgCopy.ProxyURL = effectiveProxyURL
-		sdkCfg = &sdkCfgCopy
-	} else if effectiveProxyURL != "" {
-		sdkCfgCopy := config.SDKConfig{ProxyURL: effectiveProxyURL}
-		sdkCfg = &sdkCfgCopy
 	}
 
-	// Use custom HTTP client with Firefox TLS fingerprint to bypass
-	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
-		httpClient: NewAnthropicHttpClient(sdkCfg),
+		httpClient: NewAnthropicHttpClient(effectiveProxyURL),
 	}
 }
 
