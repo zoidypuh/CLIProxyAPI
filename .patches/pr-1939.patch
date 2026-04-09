@@ -1,0 +1,156 @@
+diff --git a/internal/watcher/synthesizer/file.go b/internal/watcher/synthesizer/file.go
+index 02a0cefac8..972ae12d7b 100644
+--- a/internal/watcher/synthesizer/file.go
++++ b/internal/watcher/synthesizer/file.go
+@@ -14,6 +14,14 @@ import (
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+ )
+ 
++// cloakAuthKeys lists the cloak-related metadata keys that are propagated
++// from OAuth JSON files into auth.Attributes so that getCloakConfigFromAuth
++// can pick them up without a matching claude-api-key config entry.
++var cloakAuthKeys = []string{
++	"cloak_mode", "cloak_strict_mode",
++	"cloak_sensitive_words", "cloak_cache_user_id",
++}
++
+ // FileSynthesizer generates Auth entries from OAuth JSON files.
+ // It handles file-based authentication and Gemini virtual auth generation.
+ type FileSynthesizer struct{}
+@@ -148,6 +156,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
+ 			}
+ 		}
+ 	}
++	// Read cloak settings from auth file so that OAuth accounts can
++	// configure cloaking without a matching claude-api-key entry.
++	for _, cloakKey := range cloakAuthKeys {
++		if v, ok := metadata[cloakKey].(string); ok {
++			if trimmed := strings.TrimSpace(v); trimmed != "" {
++				a.Attributes[cloakKey] = trimmed
++			}
++		}
++	}
+ 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+ 	if provider == "gemini-cli" {
+ 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
+diff --git a/internal/watcher/synthesizer/file_test.go b/internal/watcher/synthesizer/file_test.go
+index 105d920747..981e4a9fb2 100644
+--- a/internal/watcher/synthesizer/file_test.go
++++ b/internal/watcher/synthesizer/file_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"os"
+ 	"path/filepath"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -369,6 +370,108 @@ func TestFileSynthesizer_Synthesize_PriorityParsing(t *testing.T) {
+ 	}
+ }
+ 
++func TestFileSynthesizer_Synthesize_CloakAttributes(t *testing.T) {
++	tests := []struct {
++		name      string
++		authData  map[string]any
++		wantAttrs map[string]string // expected cloak attributes
++	}{
++		{
++			name: "all cloak fields set",
++			authData: map[string]any{
++				"type":                  "claude",
++				"cloak_mode":            "full",
++				"cloak_strict_mode":     "true",
++				"cloak_sensitive_words": "API,proxy,openai",
++				"cloak_cache_user_id":   "true",
++			},
++			wantAttrs: map[string]string{
++				"cloak_mode":            "full",
++				"cloak_strict_mode":     "true",
++				"cloak_sensitive_words": "API,proxy,openai",
++				"cloak_cache_user_id":   "true",
++			},
++		},
++		{
++			name: "only cache-user-id",
++			authData: map[string]any{
++				"type":                "claude",
++				"cloak_cache_user_id": "true",
++			},
++			wantAttrs: map[string]string{
++				"cloak_cache_user_id": "true",
++			},
++		},
++		{
++			name: "whitespace trimmed",
++			authData: map[string]any{
++				"type":                "claude",
++				"cloak_cache_user_id": "  true  ",
++				"cloak_mode":          "  auto  ",
++			},
++			wantAttrs: map[string]string{
++				"cloak_cache_user_id": "true",
++				"cloak_mode":          "auto",
++			},
++		},
++		{
++			name: "empty values ignored",
++			authData: map[string]any{
++				"type":                "claude",
++				"cloak_cache_user_id": "",
++				"cloak_mode":          "   ",
++			},
++			wantAttrs: map[string]string{},
++		},
++		{
++			name: "no cloak fields",
++			authData: map[string]any{
++				"type": "claude",
++			},
++			wantAttrs: map[string]string{},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			tempDir := t.TempDir()
++			data, _ := json.Marshal(tt.authData)
++			errWriteFile := os.WriteFile(filepath.Join(tempDir, "auth.json"), data, 0644)
++			if errWriteFile != nil {
++				t.Fatalf("failed to write auth file: %v", errWriteFile)
++			}
++
++			synth := NewFileSynthesizer()
++			ctx := &SynthesisContext{
++				Config:      &config.Config{},
++				AuthDir:     tempDir,
++				Now:         time.Now(),
++				IDGenerator: NewStableIDGenerator(),
++			}
++
++			auths, errSynthesize := synth.Synthesize(ctx)
++			if errSynthesize != nil {
++				t.Fatalf("unexpected error: %v", errSynthesize)
++			}
++			if len(auths) != 1 {
++				t.Fatalf("expected 1 auth, got %d", len(auths))
++			}
++
++			cloakKeys := cloakAuthKeys
++			gotCloakAttrs := make(map[string]string)
++			for _, key := range cloakKeys {
++				if val, ok := auths[0].Attributes[key]; ok {
++					gotCloakAttrs[key] = val
++				}
++			}
++
++			if !reflect.DeepEqual(tt.wantAttrs, gotCloakAttrs) {
++				t.Errorf("cloak attributes mismatch:\n  got:  %v\n  want: %v", gotCloakAttrs, tt.wantAttrs)
++			}
++		})
++	}
++}
++
+ func TestFileSynthesizer_Synthesize_OAuthExcludedModelsMerged(t *testing.T) {
+ 	tempDir := t.TempDir()
+ 	authData := map[string]any{
