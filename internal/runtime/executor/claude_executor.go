@@ -497,7 +497,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				cloned := make([]byte, len(rewrittenLine)+1)
 				copy(cloned, rewrittenLine)
 				cloned[len(rewrittenLine)] = '\n'
->>>>>>> a5a496fa (Apply PR #2573: add Claude cloak request/response rewrites)
 				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
 			}
 			if errScan := scanner.Err(); errScan != nil {
@@ -1609,6 +1608,11 @@ func buildClaudeTextSystemBlock(text string) string {
 	return string(block)
 }
 
+func buildClaudeTextSystemBlockWithCache(text, scope string) string {
+	quoted, _ := json.Marshal(text)
+	return fmt.Sprintf(`{"type":"text","text":%s,"cache_control":{"type":"ephemeral","scope":"%s"}}`, quoted, scope)
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
@@ -1669,23 +1673,18 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	}
 
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
-	billingBlock := buildTextBlock(billingText, nil)
+	billingBlock := buildClaudeTextSystemBlock(billingText)
 
-	// Build system blocks matching real Claude Code structure.
-	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
-	// scope='org' in the API request. Only scope='global' is sent explicitly.
-	// The system prompt prefix block is sent without cache_control.
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
+	agentBlock := buildClaudeTextSystemBlockWithCache("You are Claude Code, Anthropic's official CLI for Claude.", "org")
+	introBlock := buildClaudeTextSystemBlockWithCache(helps.ClaudeCodeIntro, "global")
+	systemBlock := buildClaudeTextSystemBlock(helps.ClaudeCodeSystem)
+	doingTasksBlock := buildClaudeTextSystemBlock(strings.Join([]string{
 		helps.ClaudeCodeDoingTasks,
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, nil)
+	}, "\n\n"))
 
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
+	systemResult := "[" + billingBlock + "," + agentBlock + "," + introBlock + "," + systemBlock + "," + doingTasksBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
 	// Collect user system instructions and prepend to first user message
