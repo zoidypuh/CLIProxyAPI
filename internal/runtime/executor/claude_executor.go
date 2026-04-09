@@ -185,6 +185,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
 	body = normalizeCacheControlTTL(body)
+	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -257,6 +258,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.LogWithRequestID(ctx).Warn(msg)
 			b = []byte(msg)
 		}
+		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
@@ -301,6 +303,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
 		data = reverseRemapOAuthToolNames(data)
 	}
+	data = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, data)
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
@@ -368,6 +371,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	body = normalizeCacheControlTTL(body)
+	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -439,6 +443,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.LogWithRequestID(ctx).Warn(msg)
 			b = []byte(msg)
 		}
+		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := errBody.Close(); errClose != nil {
@@ -455,6 +460,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
+	rewriter := newClaudeCloakResponseStreamRewriter(ctx, e.cfg, auth)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -480,10 +486,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
 					line = reverseRemapOAuthToolNamesFromStreamLine(line)
 				}
-				// Forward the line as-is to preserve SSE format
-				cloned := make([]byte, len(line)+1)
-				copy(cloned, line)
-				cloned[len(line)] = '\n'
+				for _, rewrittenLine := range rewriter.RewriteLine(line) {
+					cloned := make([]byte, len(rewrittenLine)+1)
+					copy(cloned, rewrittenLine)
+					cloned[len(rewrittenLine)] = '\n'
+					out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+				}
+			}
+			for _, rewrittenLine := range rewriter.FlushPending() {
+				cloned := make([]byte, len(rewrittenLine)+1)
+				copy(cloned, rewrittenLine)
+				cloned[len(rewrittenLine)] = '\n'
+>>>>>>> a5a496fa (Apply PR #2573: add Claude cloak request/response rewrites)
 				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
 			}
 			if errScan := scanner.Err(); errScan != nil {
@@ -510,6 +524,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
 				line = reverseRemapOAuthToolNamesFromStreamLine(line)
 			}
+			for _, rewrittenLine := range rewriter.RewriteLine(line) {
+				chunks := sdktranslator.TranslateStream(
+					ctx,
+					to,
+					from,
+					req.Model,
+					opts.OriginalRequest,
+					bodyForTranslation,
+					bytes.Clone(rewrittenLine),
+					&param,
+				)
+				for i := range chunks {
+					out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				}
+			}
+		}
+		for _, rewrittenLine := range rewriter.FlushPending() {
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
@@ -517,7 +548,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				req.Model,
 				opts.OriginalRequest,
 				bodyForTranslation,
-				bytes.Clone(line),
+				bytes.Clone(rewrittenLine),
 				&param,
 			)
 			for i := range chunks {
@@ -562,6 +593,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
 	body = normalizeCacheControlTTL(body)
+	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
 
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
@@ -623,6 +655,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 			helps.LogWithRequestID(ctx).Warn(msg)
 			b = []byte(msg)
 		}
+		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
@@ -1905,7 +1938,7 @@ func countCacheControls(payload []byte) int {
 // Anthropic evaluates blocks in order: tools → system (index 0..N) → messages.
 // Within each section, blocks are evaluated in array order. A 5m (default) block
 // followed by a 1h block at ANY later position is an error — including within
-// the same section (e.g. system[1]=5m then system[3]=1h).
+// the same section (e.g. system[2]=5m then system[3]=1h).
 //
 // Strategy: walk all cache_control blocks in evaluation order. Once a 5m block
 // is seen, strip ttl from ALL subsequent 1h blocks (downgrading them to 5m).
