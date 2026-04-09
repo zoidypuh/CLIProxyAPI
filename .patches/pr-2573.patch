@@ -1,0 +1,998 @@
+diff --git a/internal/api/handlers/management/config_lists.go b/internal/api/handlers/management/config_lists.go
+index 083d4e31ef..c645108dff 100644
+--- a/internal/api/handlers/management/config_lists.go
++++ b/internal/api/handlers/management/config_lists.go
+@@ -278,6 +278,8 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
+ 		Models         *[]config.ClaudeModel `json:"models"`
+ 		Headers        *map[string]string    `json:"headers"`
+ 		ExcludedModels *[]string             `json:"excluded-models"`
++		Cloak          *config.CloakConfig   `json:"cloak"`
++		Experimental   *bool                 `json:"experimental-cch-signing"`
+ 	}
+ 	var body struct {
+ 		Index *int            `json:"index"`
+@@ -328,6 +330,13 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
+ 	if body.Value.ExcludedModels != nil {
+ 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+ 	}
++	if body.Value.Cloak != nil {
++		copyCloak := *body.Value.Cloak
++		entry.Cloak = &copyCloak
++	}
++	if body.Value.Experimental != nil {
++		entry.ExperimentalCCHSigning = *body.Value.Experimental
++	}
+ 	normalizeClaudeKey(&entry)
+ 	h.cfg.ClaudeKey[targetIndex] = entry
+ 	h.cfg.SanitizeClaudeKeys()
+diff --git a/internal/config/claude_cloak_replacements_test.go b/internal/config/claude_cloak_replacements_test.go
+new file mode 100644
+index 0000000000..9d2349265e
+--- /dev/null
++++ b/internal/config/claude_cloak_replacements_test.go
+@@ -0,0 +1,52 @@
++package config
++
++import "testing"
++
++func TestSanitizeClaudeKeys_NormalizesCloakReplacements(t *testing.T) {
++	cfg := &Config{
++		ClaudeKey: []ClaudeKey{{
++			APIKey: "key-123",
++			Cloak: &CloakConfig{
++				RequestReplacements: []TextReplacement{
++					{Find: " OpenClaw ", Replace: " OCPlatform "},
++					{Find: "OpenClaw", Replace: "ignored"},
++					{Find: "", Replace: "skip"},
++				},
++				ResponseReplacements: []TextReplacement{
++					{Find: " create_task ", Replace: " sessions_spawn "},
++					{Find: "create_task", Replace: "ignored"},
++					{Find: " ", Replace: "skip"},
++				},
++			},
++		}},
++	}
++
++	cfg.SanitizeClaudeKeys()
++
++	cloak := cfg.ClaudeKey[0].Cloak
++	if cloak == nil {
++		t.Fatalf("expected cloak config to be preserved")
++	}
++
++	// Whitespace is preserved; " OpenClaw " and "OpenClaw" are distinct keys.
++	if len(cloak.RequestReplacements) != 2 {
++		t.Fatalf("request replacements len = %d, want 2", len(cloak.RequestReplacements))
++	}
++	if got := cloak.RequestReplacements[0]; got.Find != " OpenClaw " || got.Replace != " OCPlatform " {
++		t.Fatalf("request replacement[0] = %#v, want \" OpenClaw \" -> \" OCPlatform \"", got)
++	}
++	if got := cloak.RequestReplacements[1]; got.Find != "OpenClaw" || got.Replace != "ignored" {
++		t.Fatalf("request replacement[1] = %#v, want OpenClaw -> ignored", got)
++	}
++
++	// " " is empty after trim so it's skipped; the other two are distinct.
++	if len(cloak.ResponseReplacements) != 2 {
++		t.Fatalf("response replacements len = %d, want 2", len(cloak.ResponseReplacements))
++	}
++	if got := cloak.ResponseReplacements[0]; got.Find != " create_task " || got.Replace != " sessions_spawn " {
++		t.Fatalf("response replacement[0] = %#v, want \" create_task \" -> \" sessions_spawn \"", got)
++	}
++	if got := cloak.ResponseReplacements[1]; got.Find != "create_task" || got.Replace != "ignored" {
++		t.Fatalf("response replacement[1] = %#v, want create_task -> ignored", got)
++	}
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 15847f57e0..f4ab25b77d 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -313,6 +313,13 @@ type PayloadModelRule struct {
+ 	Protocol string `yaml:"protocol" json:"protocol"`
+ }
+ 
++// TextReplacement defines a literal find/replace rule used for cloaked
++// request or response body rewriting.
++type TextReplacement struct {
++	Find    string `yaml:"find" json:"find"`
++	Replace string `yaml:"replace" json:"replace"`
++}
++
+ // CloakConfig configures request cloaking for non-Claude-Code clients.
+ // Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
+ type CloakConfig struct {
+@@ -334,6 +341,14 @@ type CloakConfig struct {
+ 	// CacheUserID controls whether Claude user_id values are cached per API key.
+ 	// When false, a fresh random user_id is generated for every request.
+ 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
++
++	// RequestReplacements applies literal outbound request rewrites after cloaking
++	// is enabled for the current request.
++	RequestReplacements []TextReplacement `yaml:"request-replacements,omitempty" json:"request-replacements,omitempty"`
++
++	// ResponseReplacements applies literal inbound response rewrites before the
++	// payload is returned to the downstream client.
++	ResponseReplacements []TextReplacement `yaml:"response-replacements,omitempty" json:"response-replacements,omitempty"`
+ }
+ 
+ // ClaudeKey represents the configuration for a Claude API key,
+@@ -861,6 +876,11 @@ func (cfg *Config) SanitizeClaudeKeys() {
+ 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+ 		entry.Headers = NormalizeHeaders(entry.Headers)
+ 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
++		if entry.Cloak != nil {
++			entry.Cloak.Mode = strings.TrimSpace(entry.Cloak.Mode)
++			entry.Cloak.RequestReplacements = NormalizeTextReplacements(entry.Cloak.RequestReplacements)
++			entry.Cloak.ResponseReplacements = NormalizeTextReplacements(entry.Cloak.ResponseReplacements)
++		}
+ 	}
+ }
+ 
+@@ -929,6 +949,34 @@ func NormalizeHeaders(headers map[string]string) map[string]string {
+ 	return clean
+ }
+ 
++// NormalizeTextReplacements trims and deduplicates literal text replacement
++// rules by their find token, preserving the first occurrence.
++func NormalizeTextReplacements(entries []TextReplacement) []TextReplacement {
++	if len(entries) == 0 {
++		return nil
++	}
++	seen := make(map[string]struct{}, len(entries))
++	out := make([]TextReplacement, 0, len(entries))
++	for _, entry := range entries {
++		find := entry.Find
++		if strings.TrimSpace(find) == "" {
++			continue
++		}
++		if _, ok := seen[find]; ok {
++			continue
++		}
++		seen[find] = struct{}{}
++		out = append(out, TextReplacement{
++			Find:    find,
++			Replace: entry.Replace,
++		})
++	}
++	if len(out) == 0 {
++		return nil
++	}
++	return out
++}
++
+ // NormalizeExcludedModels trims, lowercases, and deduplicates model exclusion patterns.
+ // It preserves the order of first occurrences and drops empty entries.
+ func NormalizeExcludedModels(models []string) []string {
+diff --git a/internal/runtime/executor/claude_cloak_replacements.go b/internal/runtime/executor/claude_cloak_replacements.go
+new file mode 100644
+index 0000000000..a7e219de3f
+--- /dev/null
++++ b/internal/runtime/executor/claude_cloak_replacements.go
+@@ -0,0 +1,394 @@
++package executor
++
++import (
++	"bytes"
++	"context"
++	"strings"
++
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
++	"github.com/tidwall/gjson"
++	"github.com/tidwall/sjson"
++)
++
++func shouldApplyClaudeCloak(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) bool {
++	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
++	attrMode, _, _, _ := getCloakConfigFromAuth(auth)
++
++	cloakMode := attrMode
++	if cloakCfg != nil {
++		if mode := strings.TrimSpace(cloakCfg.Mode); mode != "" {
++			cloakMode = mode
++		}
++	}
++
++	return helps.ShouldCloak(cloakMode, getClientUserAgent(ctx))
++}
++
++func applyTextReplacements(body []byte, replacements []config.TextReplacement) []byte {
++	if len(body) == 0 || len(replacements) == 0 {
++		return body
++	}
++	out := body
++	for _, replacement := range replacements {
++		if replacement.Find == "" {
++			continue
++		}
++		out = bytes.ReplaceAll(out, []byte(replacement.Find), []byte(replacement.Replace))
++	}
++	return out
++}
++
++func applyClaudeCloakRequestReplacements(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, body []byte) []byte {
++	if !shouldApplyClaudeCloak(ctx, cfg, auth) {
++		return body
++	}
++	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
++	if cloakCfg == nil {
++		return body
++	}
++	return applyTextReplacements(body, cloakCfg.RequestReplacements)
++}
++
++func applyClaudeCloakResponseReplacements(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, body []byte) []byte {
++	if !shouldApplyClaudeCloak(ctx, cfg, auth) {
++		return body
++	}
++	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
++	if cloakCfg == nil {
++		return body
++	}
++	return applyTextReplacements(body, cloakCfg.ResponseReplacements)
++}
++
++type claudeCloakResponseStreamKey struct {
++	kind  string
++	index int
++}
++
++type claudeCloakReplacementStage struct {
++	find    []byte
++	replace []byte
++	pending []byte
++}
++
++func newClaudeCloakReplacementStage(replacement config.TextReplacement) *claudeCloakReplacementStage {
++	if replacement.Find == "" {
++		return nil
++	}
++	return &claudeCloakReplacementStage{
++		find:    []byte(replacement.Find),
++		replace: []byte(replacement.Replace),
++	}
++}
++
++func (s *claudeCloakReplacementStage) process(fragment []byte, flush bool) []byte {
++	if s == nil {
++		return fragment
++	}
++	combined := make([]byte, 0, len(s.pending)+len(fragment))
++	combined = append(combined, s.pending...)
++	combined = append(combined, fragment...)
++	if len(combined) == 0 {
++		return nil
++	}
++	if flush {
++		s.pending = s.pending[:0]
++		return bytes.ReplaceAll(combined, s.find, s.replace)
++	}
++
++	out := make([]byte, 0, len(combined))
++	i := 0
++	for i < len(combined) {
++		if bytes.HasPrefix(combined[i:], s.find) {
++			out = append(out, s.replace...)
++			i += len(s.find)
++			continue
++		}
++		if len(combined)-i < len(s.find) && bytes.HasPrefix(s.find, combined[i:]) {
++			break
++		}
++		out = append(out, combined[i])
++		i++
++	}
++
++	s.pending = append(s.pending[:0], combined[i:]...)
++	return out
++}
++
++type claudeCloakResponseTextStream struct {
++	stages []*claudeCloakReplacementStage
++}
++
++func newClaudeCloakResponseTextStream(replacements []config.TextReplacement) *claudeCloakResponseTextStream {
++	stages := make([]*claudeCloakReplacementStage, 0, len(replacements))
++	for _, replacement := range replacements {
++		stage := newClaudeCloakReplacementStage(replacement)
++		if stage != nil {
++			stages = append(stages, stage)
++		}
++	}
++	return &claudeCloakResponseTextStream{stages: stages}
++}
++
++func (s *claudeCloakResponseTextStream) Consume(fragment []byte) []byte {
++	return s.process(fragment, false)
++}
++
++func (s *claudeCloakResponseTextStream) Flush() []byte {
++	return s.process(nil, true)
++}
++
++func (s *claudeCloakResponseTextStream) process(fragment []byte, flush bool) []byte {
++	if s == nil {
++		return fragment
++	}
++	out := fragment
++	for _, stage := range s.stages {
++		out = stage.process(out, flush)
++	}
++	return out
++}
++
++type claudeCloakResponseStreamRewriter struct {
++	replacements []config.TextReplacement
++	blockKinds   map[int]string
++	streams      map[claudeCloakResponseStreamKey]*claudeCloakResponseTextStream
++	frame        [][]byte
++}
++
++func newClaudeCloakResponseStreamRewriter(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) *claudeCloakResponseStreamRewriter {
++	if !shouldApplyClaudeCloak(ctx, cfg, auth) {
++		return nil
++	}
++	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
++	if cloakCfg == nil || len(cloakCfg.ResponseReplacements) == 0 {
++		return nil
++	}
++	return &claudeCloakResponseStreamRewriter{
++		replacements: cloakCfg.ResponseReplacements,
++		blockKinds:   make(map[int]string),
++		streams:      make(map[claudeCloakResponseStreamKey]*claudeCloakResponseTextStream),
++	}
++}
++
++func (r *claudeCloakResponseStreamRewriter) RewriteLine(line []byte) [][]byte {
++	if r == nil {
++		return [][]byte{line}
++	}
++	cloned := append([]byte(nil), line...)
++	if len(bytes.TrimSpace(cloned)) == 0 {
++		if len(r.frame) == 0 {
++			return [][]byte{cloned}
++		}
++		out := r.rewriteFrame(r.frame)
++		r.frame = nil
++		if len(out) == 0 {
++			return nil
++		}
++		return append(out, []byte{})
++	}
++	r.frame = append(r.frame, cloned)
++	return nil
++}
++
++func (r *claudeCloakResponseStreamRewriter) FlushPending() [][]byte {
++	if r == nil || len(r.frame) == 0 {
++		return nil
++	}
++	out := r.rewriteFrame(r.frame)
++	r.frame = nil
++	return out
++}
++
++func (r *claudeCloakResponseStreamRewriter) rewriteFrame(frame [][]byte) [][]byte {
++	if len(frame) == 0 {
++		return nil
++	}
++	dataIdx, payload, ok := claudeCloakResponseFramePayload(frame)
++	if !ok || !gjson.ValidBytes(payload) {
++		return claudeCloakCloneLines(frame)
++	}
++
++	root := gjson.ParseBytes(payload)
++	switch root.Get("type").String() {
++	case "content_block_start":
++		if kind := claudeCloakResponseBlockKind(root.Get("content_block.type").String()); kind != "" {
++			r.blockKinds[int(root.Get("index").Int())] = kind
++		}
++		return claudeCloakCloneLines(frame)
++	case "content_block_delta":
++		kind, fieldPath, _ := claudeCloakResponseDeltaSpec(root.Get("delta.type").String())
++		if kind == "" {
++			return claudeCloakCloneLines(frame)
++		}
++		index := int(root.Get("index").Int())
++		updatedFragment := r.stream(kind, index).Consume([]byte(root.Get(fieldPath).String()))
++		if len(updatedFragment) == 0 {
++			return nil
++		}
++		updatedPayload, err := sjson.SetBytes(payload, fieldPath, string(updatedFragment))
++		if err != nil {
++			return claudeCloakCloneLines(frame)
++		}
++		r.blockKinds[index] = kind
++		return claudeCloakResponseReplaceFramePayload(frame, dataIdx, updatedPayload)
++	case "content_block_stop":
++		index := int(root.Get("index").Int())
++		kind := r.blockKinds[index]
++		delete(r.blockKinds, index)
++		flushed := r.flush(kind, index)
++		stopFrame := claudeCloakCloneLines(frame)
++		if kind == "" || len(flushed) == 0 {
++			return stopFrame
++		}
++		deltaPayload := claudeCloakResponseDeltaPayload(index, kind, flushed)
++		if len(deltaPayload) == 0 {
++			return stopFrame
++		}
++		deltaFrame := claudeCloakResponseSyntheticFrame(frame, deltaPayload, "content_block_delta")
++		out := make([][]byte, 0, len(deltaFrame)+1+len(stopFrame))
++		out = append(out, deltaFrame...)
++		out = append(out, []byte{})
++		out = append(out, stopFrame...)
++		return out
++	default:
++		return claudeCloakCloneLines(frame)
++	}
++}
++
++func (r *claudeCloakResponseStreamRewriter) stream(kind string, index int) *claudeCloakResponseTextStream {
++	key := claudeCloakResponseStreamKey{kind: kind, index: index}
++	if stream, ok := r.streams[key]; ok {
++		return stream
++	}
++	stream := newClaudeCloakResponseTextStream(r.replacements)
++	r.streams[key] = stream
++	return stream
++}
++
++func (r *claudeCloakResponseStreamRewriter) flush(kind string, index int) []byte {
++	if kind == "" {
++		return nil
++	}
++	key := claudeCloakResponseStreamKey{kind: kind, index: index}
++	stream, ok := r.streams[key]
++	if !ok {
++		return nil
++	}
++	delete(r.streams, key)
++	return stream.Flush()
++}
++
++func claudeCloakResponseBlockKind(blockType string) string {
++	switch blockType {
++	case "text":
++		return "text"
++	case "thinking":
++		return "thinking"
++	case "tool_use":
++		return "input_json"
++	default:
++		return ""
++	}
++}
++
++func claudeCloakResponseDeltaSpec(deltaType string) (kind string, fieldPath string, emittedType string) {
++	switch deltaType {
++	case "text_delta":
++		return "text", "delta.text", "text_delta"
++	case "thinking_delta":
++		return "thinking", "delta.thinking", "thinking_delta"
++	case "input_json_delta":
++		return "input_json", "delta.partial_json", "input_json_delta"
++	default:
++		return "", "", ""
++	}
++}
++
++func claudeCloakResponseDeltaPayload(index int, kind string, fragment []byte) []byte {
++	var payload []byte
++	switch kind {
++	case "text":
++		payload = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
++		payload, _ = sjson.SetBytes(payload, "delta.text", string(fragment))
++	case "thinking":
++		payload = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
++		payload, _ = sjson.SetBytes(payload, "delta.thinking", string(fragment))
++	case "input_json":
++		payload = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
++		payload, _ = sjson.SetBytes(payload, "delta.partial_json", string(fragment))
++	default:
++		return nil
++	}
++	payload, _ = sjson.SetBytes(payload, "index", index)
++	return payload
++}
++
++func claudeCloakResponseSyntheticFrame(baseFrame [][]byte, payload []byte, eventName string) [][]byte {
++	if len(baseFrame) == 0 {
++		return nil
++	}
++	out := make([][]byte, 0, 2)
++	if claudeCloakFrameHasEventLine(baseFrame) {
++		out = append(out, []byte("event: "+eventName))
++	}
++	out = append(out, claudeCloakResponseStreamLine(claudeCloakResponseReferenceDataLine(baseFrame), payload))
++	return out
++}
++
++func claudeCloakResponseReplaceFramePayload(frame [][]byte, dataIdx int, payload []byte) [][]byte {
++	out := claudeCloakCloneLines(frame)
++	out[dataIdx] = claudeCloakResponseStreamLine(frame[dataIdx], payload)
++	return out
++}
++
++func claudeCloakResponseFramePayload(frame [][]byte) (int, []byte, bool) {
++	for i, line := range frame {
++		payload := helps.JSONPayload(line)
++		if len(payload) == 0 {
++			continue
++		}
++		return i, payload, true
++	}
++	return -1, nil, false
++}
++
++func claudeCloakFrameHasEventLine(frame [][]byte) bool {
++	for _, line := range frame {
++		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("event:")) {
++			return true
++		}
++	}
++	return false
++}
++
++func claudeCloakResponseReferenceDataLine(frame [][]byte) []byte {
++	for _, line := range frame {
++		trimmed := bytes.TrimSpace(line)
++		if bytes.HasPrefix(trimmed, []byte("data:")) {
++			return line
++		}
++	}
++	return []byte("data:")
++}
++
++func claudeCloakCloneLines(lines [][]byte) [][]byte {
++	out := make([][]byte, len(lines))
++	for i, line := range lines {
++		out[i] = append([]byte(nil), line...)
++	}
++	return out
++}
++
++func claudeCloakResponseStreamLine(line []byte, payload []byte) []byte {
++	trimmed := bytes.TrimSpace(line)
++	if bytes.HasPrefix(trimmed, []byte("data:")) {
++		out := make([]byte, 0, len(payload)+6)
++		out = append(out, []byte("data: ")...)
++		out = append(out, payload...)
++		return out
++	}
++	return append([]byte(nil), payload...)
++}
+diff --git a/internal/runtime/executor/claude_cloak_replacements_test.go b/internal/runtime/executor/claude_cloak_replacements_test.go
+new file mode 100644
+index 0000000000..ae4735d5ad
+--- /dev/null
++++ b/internal/runtime/executor/claude_cloak_replacements_test.go
+@@ -0,0 +1,295 @@
++package executor
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
++)
++
++func TestClaudeExecutor_Execute_AppliesRequestReplacementsAfterPayloadConfig(t *testing.T) {
++	var seenBody []byte
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		seenBody = append([]byte(nil), body...)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
++	}))
++	defer server.Close()
++
++	cfg := &config.Config{
++		ClaudeKey: []config.ClaudeKey{{
++			APIKey:  "key-123",
++			BaseURL: server.URL,
++			Cloak: &config.CloakConfig{
++				Mode: "always",
++				RequestReplacements: []config.TextReplacement{{
++					Find:    "OpenClaw",
++					Replace: "OCPlatform",
++				}},
++			},
++		}},
++		Payload: config.PayloadConfig{
++			Override: []config.PayloadRule{{
++				Models: []config.PayloadModelRule{{Name: "claude-3-5-sonnet-20241022", Protocol: "claude"}},
++				Params: map[string]any{"messages.0.content.0.text": "OpenClaw"},
++			}},
++		},
++	}
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{
++		"api_key":  "key-123",
++		"base_url": server.URL,
++	}}
++
++	executor := NewClaudeExecutor(cfg)
++	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "claude-3-5-sonnet-20241022",
++		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
++	if err != nil {
++		t.Fatalf("Execute() error = %v", err)
++	}
++
++	bodyText := string(seenBody)
++	if !strings.Contains(bodyText, "OCPlatform") {
++		t.Fatalf("expected final outbound body to include replaced payload text, got %s", bodyText)
++	}
++	if strings.Contains(bodyText, "OpenClaw") {
++		t.Fatalf("expected final outbound body to exclude unreplaced payload text, got %s", bodyText)
++	}
++}
++
++func TestClaudeExecutor_ExecuteStream_AppliesResponseReplacementsAcrossDeltaBoundaries(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		flusher, _ := w.(http.Flusher)
++		for _, line := range []string{
++			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}`,
++			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
++			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Open"}}`,
++			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Claw"}}`,
++			`data: {"type":"content_block_stop","index":0}`,
++			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
++			`data: {"type":"message_stop"}`,
++		} {
++			_, _ = io.WriteString(w, line+"\n\n")
++			if flusher != nil {
++				flusher.Flush()
++			}
++		}
++	}))
++	defer server.Close()
++
++	cfg := &config.Config{
++		ClaudeKey: []config.ClaudeKey{{
++			APIKey:  "key-123",
++			BaseURL: server.URL,
++			Cloak: &config.CloakConfig{
++				Mode: "always",
++				ResponseReplacements: []config.TextReplacement{{
++					Find:    "OpenClaw",
++					Replace: "OCPlatform",
++				}},
++			},
++		}},
++	}
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{
++		"api_key":  "key-123",
++		"base_url": server.URL,
++	}}
++
++	executor := NewClaudeExecutor(cfg)
++	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "claude-3-5-sonnet-20241022",
++		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
++	if err != nil {
++		t.Fatalf("ExecuteStream() error = %v", err)
++	}
++
++	var out strings.Builder
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("stream chunk error = %v", chunk.Err)
++		}
++		out.Write(chunk.Payload)
++	}
++
++	streamText := out.String()
++	if !strings.Contains(streamText, `"text":"OCPlatform"`) {
++		t.Fatalf("expected rewritten stream delta in output, got %s", streamText)
++	}
++	if strings.Contains(streamText, `"text":"Open"`) || strings.Contains(streamText, `"text":"Claw"`) {
++		t.Fatalf("expected boundary-spanning upstream deltas to be suppressed, got %s", streamText)
++	}
++}
++
++func TestApplyClaudeCloakResponseReplacements_AppliesReverseMap(t *testing.T) {
++	cfg := &config.Config{
++		ClaudeKey: []config.ClaudeKey{{
++			APIKey: "key-123",
++			Cloak: &config.CloakConfig{
++				Mode: "always",
++				ResponseReplacements: []config.TextReplacement{
++					{Find: "OCPlatform", Replace: "OpenClaw"},
++					{Find: "create_task", Replace: "sessions_spawn"},
++				},
++			},
++		}},
++	}
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
++
++	out := applyClaudeCloakResponseReplacements(context.Background(), cfg, auth, []byte(`{"text":"OCPlatform create_task"}`))
++	text := string(out)
++	if strings.Contains(text, "OCPlatform") || strings.Contains(text, "create_task") {
++		t.Fatalf("expected reverse mapping to restore original text, got %s", text)
++	}
++	if !strings.Contains(text, "OpenClaw") || !strings.Contains(text, "sessions_spawn") {
++		t.Fatalf("expected reverse mapping to restore original text, got %s", text)
++	}
++}
++
++func TestClaudeCloakResponseTextStream_AppliesChainedRulesLikeNonStream(t *testing.T) {
++	replacements := []config.TextReplacement{
++		{Find: "A", Replace: "B"},
++		{Find: "B", Replace: "C"},
++	}
++
++	stream := newClaudeCloakResponseTextStream(replacements)
++	got := string(stream.Consume([]byte("A"))) + string(stream.Flush())
++	if got != "C" {
++		t.Fatalf("stream output = %q, want C", got)
++	}
++}
++
++func TestClaudeExecutor_ExecuteStream_PreservesSSEEventPairingForInjectedDelta(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		flusher, _ := w.(http.Flusher)
++		for _, frame := range []string{
++			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}",
++			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
++			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Open\"}}",
++			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Claw\"}}",
++			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}",
++			"event: message_stop\ndata: {\"type\":\"message_stop\"}",
++		} {
++			_, _ = io.WriteString(w, frame+"\n\n")
++			if flusher != nil {
++				flusher.Flush()
++			}
++		}
++	}))
++	defer server.Close()
++
++	cfg := &config.Config{
++		ClaudeKey: []config.ClaudeKey{{
++			APIKey:  "key-123",
++			BaseURL: server.URL,
++			Cloak: &config.CloakConfig{
++				Mode: "always",
++				ResponseReplacements: []config.TextReplacement{{
++					Find:    "OpenClaw",
++					Replace: "OCPlatform",
++				}},
++			},
++		}},
++	}
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{
++		"api_key":  "key-123",
++		"base_url": server.URL,
++	}}
++
++	executor := NewClaudeExecutor(cfg)
++	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "claude-3-5-sonnet-20241022",
++		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
++	if err != nil {
++		t.Fatalf("ExecuteStream() error = %v", err)
++	}
++
++	var out strings.Builder
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("stream chunk error = %v", chunk.Err)
++		}
++		out.Write(chunk.Payload)
++	}
++
++	streamText := out.String()
++	if !strings.Contains(streamText, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OCPlatform\"}}") {
++		t.Fatalf("expected injected delta to carry a matching content_block_delta event, got %s", streamText)
++	}
++	if strings.Contains(streamText, "event: content_block_delta\nevent: content_block_delta") {
++		t.Fatalf("expected no orphaned or duplicated content_block_delta event headers, got %s", streamText)
++	}
++}
++
++func TestClaudeExecutor_ExecuteStream_DropsEventHeaderWhenDeltaPayloadBecomesEmpty(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		flusher, _ := w.(http.Flusher)
++		for _, frame := range []string{
++			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
++			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OpenClaw\"}}",
++			"event: message_stop\ndata: {\"type\":\"message_stop\"}",
++		} {
++			_, _ = io.WriteString(w, frame+"\n\n")
++			if flusher != nil {
++				flusher.Flush()
++			}
++		}
++	}))
++	defer server.Close()
++
++	cfg := &config.Config{
++		ClaudeKey: []config.ClaudeKey{{
++			APIKey:  "key-123",
++			BaseURL: server.URL,
++			Cloak: &config.CloakConfig{
++				Mode: "always",
++				ResponseReplacements: []config.TextReplacement{{
++					Find:    "OpenClaw",
++					Replace: "",
++				}},
++			},
++		}},
++	}
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{
++		"api_key":  "key-123",
++		"base_url": server.URL,
++	}}
++
++	executor := NewClaudeExecutor(cfg)
++	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "claude-3-5-sonnet-20241022",
++		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
++	if err != nil {
++		t.Fatalf("ExecuteStream() error = %v", err)
++	}
++
++	var out strings.Builder
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("stream chunk error = %v", chunk.Err)
++		}
++		out.Write(chunk.Payload)
++	}
++
++	streamText := out.String()
++	if strings.Contains(streamText, "event: content_block_delta") {
++		t.Fatalf("expected dropped delta frame to remove its event header too, got %s", streamText)
++	}
++	if !strings.Contains(streamText, "event: message_stop\ndata: {\"type\":\"message_stop\"}") {
++		t.Fatalf("expected the next SSE frame to stay well-formed, got %s", streamText)
++	}
++}
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+index 7b2e5d8d5b..edd999e219 100644
+--- a/internal/runtime/executor/claude_executor.go
++++ b/internal/runtime/executor/claude_executor.go
+@@ -152,6 +152,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+ 	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
+ 	body = normalizeCacheControlTTL(body)
++	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
+ 
+ 	// Extract betas from body and convert to header
+ 	var extraBetas []string
+@@ -214,6 +215,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 			helps.LogWithRequestID(ctx).Warn(msg)
+ 			b = []byte(msg)
+ 		}
++		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+ 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+@@ -254,6 +256,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+ 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
+ 	}
++	data = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, data)
+ 	var param any
+ 	out := sdktranslator.TranslateNonStream(
+ 		ctx,
+@@ -320,6 +323,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 
+ 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+ 	body = normalizeCacheControlTTL(body)
++	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
+ 
+ 	// Extract betas from body and convert to header
+ 	var extraBetas []string
+@@ -382,6 +386,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 			helps.LogWithRequestID(ctx).Warn(msg)
+ 			b = []byte(msg)
+ 		}
++		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+ 		if errClose := errBody.Close(); errClose != nil {
+@@ -398,6 +403,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		}
+ 		return nil, err
+ 	}
++	rewriter := newClaudeCloakResponseStreamRewriter(ctx, e.cfg, auth)
+ 	out := make(chan cliproxyexecutor.StreamChunk)
+ 	go func() {
+ 		defer close(out)
+@@ -420,10 +426,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+ 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
+ 				}
+-				// Forward the line as-is to preserve SSE format
+-				cloned := make([]byte, len(line)+1)
+-				copy(cloned, line)
+-				cloned[len(line)] = '\n'
++				for _, rewrittenLine := range rewriter.RewriteLine(line) {
++					cloned := make([]byte, len(rewrittenLine)+1)
++					copy(cloned, rewrittenLine)
++					cloned[len(rewrittenLine)] = '\n'
++					out <- cliproxyexecutor.StreamChunk{Payload: cloned}
++				}
++			}
++			for _, rewrittenLine := range rewriter.FlushPending() {
++				cloned := make([]byte, len(rewrittenLine)+1)
++				copy(cloned, rewrittenLine)
++				cloned[len(rewrittenLine)] = '\n'
+ 				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+ 			}
+ 			if errScan := scanner.Err(); errScan != nil {
+@@ -447,6 +460,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+ 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
+ 			}
++			for _, rewrittenLine := range rewriter.RewriteLine(line) {
++				chunks := sdktranslator.TranslateStream(
++					ctx,
++					to,
++					from,
++					req.Model,
++					opts.OriginalRequest,
++					bodyForTranslation,
++					bytes.Clone(rewrittenLine),
++					&param,
++				)
++				for i := range chunks {
++					out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
++				}
++			}
++		}
++		for _, rewrittenLine := range rewriter.FlushPending() {
+ 			chunks := sdktranslator.TranslateStream(
+ 				ctx,
+ 				to,
+@@ -454,7 +484,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 				req.Model,
+ 				opts.OriginalRequest,
+ 				bodyForTranslation,
+-				bytes.Clone(line),
++				bytes.Clone(rewrittenLine),
+ 				&param,
+ 			)
+ 			for i := range chunks {
+@@ -492,6 +522,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
+ 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
+ 	body = enforceCacheControlLimit(body, 4)
+ 	body = normalizeCacheControlTTL(body)
++	body = applyClaudeCloakRequestReplacements(ctx, e.cfg, auth, body)
+ 
+ 	// Extract betas from body and convert to header (for count_tokens too)
+ 	var extraBetas []string
+@@ -549,6 +580,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
+ 			helps.LogWithRequestID(ctx).Warn(msg)
+ 			b = []byte(msg)
+ 		}
++		b = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, b)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+ 		if errClose := errBody.Close(); errClose != nil {
+ 			log.Errorf("response body close error: %v", errClose)
+@@ -1646,7 +1678,7 @@ func stripMessageCacheControl(messages []any, excess *int) {
+ // Anthropic evaluates blocks in order: tools → system (index 0..N) → messages.
+ // Within each section, blocks are evaluated in array order. A 5m (default) block
+ // followed by a 1h block at ANY later position is an error — including within
+-// the same section (e.g. system[1]=5m then system[3]=1h).
++// the same section (e.g. system[2]=5m then system[3]=1h).
+ //
+ // Strategy: walk all cache_control blocks in evaluation order. Once a 5m block
+ // is seen, strip ttl from ALL subsequent 1h blocks (downgrading them to 5m).

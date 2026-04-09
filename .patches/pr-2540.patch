@@ -1,0 +1,355 @@
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+index 7b2e5d8d5b..b58b30acbf 100644
+--- a/internal/runtime/executor/claude_executor.go
++++ b/internal/runtime/executor/claude_executor.go
+@@ -486,7 +486,14 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
+ 	body, _ = sjson.SetBytes(body, "model", baseModel)
+ 
+ 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+-		body = checkSystemInstructions(body)
++		body = checkSystemInstructionsWithSigningMode(
++			body,
++			false,
++			false,
++			helps.DefaultClaudeVersion(e.cfg),
++			resolveOutboundClaudeEntrypoint(ctx, e.cfg, auth, apiKey),
++			"",
++		)
+ 	}
+ 
+ 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
+@@ -834,7 +841,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
+ 		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
+ 	}
+ 
+-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
++	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+ 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
+ 		baseBetas = val
+ 		if !strings.Contains(val, "oauth") {
+@@ -877,7 +884,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
+ 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
+ 	}
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
+-	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
++	// Values below match Claude Code 2.1.92 / @anthropic-ai/sdk 0.80.0 (updated 2026-04-04).
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
+@@ -888,6 +895,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
+ 	if isAnthropicBase {
+ 		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
+ 	}
++	misc.EnsureHeader(r.Header, ginHeaders, "Accept-Language", "*")
++	misc.EnsureHeader(r.Header, ginHeaders, "Sec-Fetch-Mode", "cors")
+ 	r.Header.Set("Connection", "keep-alive")
+ 	if stream {
+ 		r.Header.Set("Accept", "text/event-stream")
+@@ -897,7 +906,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
+ 		r.Header.Set("Accept-Encoding", "identity")
+ 	} else {
+ 		r.Header.Set("Accept", "application/json")
+-		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
++		r.Header.Set("Accept-Encoding", "br, gzip, deflate")
+ 	}
+ 	// Legacy mode keeps OS/Arch runtime-derived; stabilized mode pins OS/Arch
+ 	// to the configured baseline while still allowing newer official
+@@ -937,7 +946,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+ }
+ 
+ func checkSystemInstructions(payload []byte) []byte {
+-	return checkSystemInstructionsWithSigningMode(payload, false, false, "2.1.63", "", "")
++	return checkSystemInstructionsWithSigningMode(payload, false, false, "2.1.92", "", "")
+ }
+ 
+ func isClaudeOAuthToken(apiKey string) bool {
+@@ -1156,6 +1165,50 @@ func parseEntrypointFromUA(userAgent string) string {
+ 	return "cli"
+ }
+ 
++func getAuthUserAgentOverride(auth *cliproxyauth.Auth) string {
++	if auth == nil || len(auth.Attributes) == 0 {
++		return ""
++	}
++	for key, value := range auth.Attributes {
++		trimmedKey := strings.TrimSpace(key)
++		if len(trimmedKey) < len("header:") || !strings.HasPrefix(strings.ToLower(trimmedKey), "header:") {
++			continue
++		}
++		name := strings.TrimSpace(trimmedKey[len("header:"):])
++		if strings.EqualFold(name, "User-Agent") {
++			return strings.TrimSpace(value)
++		}
++	}
++	return ""
++}
++
++func getGinHeadersFromContext(ctx context.Context) http.Header {
++	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
++		return ginCtx.Request.Header
++	}
++	return nil
++}
++
++func resolveOutboundClaudeUserAgent(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, apiKey string) string {
++	if authUA := getAuthUserAgentOverride(auth); authUA != "" {
++		return authUA
++	}
++
++	ginHeaders := getGinHeadersFromContext(ctx)
++	if helps.ClaudeDeviceProfileStabilizationEnabled(cfg) {
++		profile := helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
++		return strings.TrimSpace(profile.UserAgent)
++	}
++
++	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
++	helps.ApplyClaudeLegacyDeviceHeaders(req, ginHeaders, cfg)
++	return strings.TrimSpace(req.Header.Get("User-Agent"))
++}
++
++func resolveOutboundClaudeEntrypoint(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, apiKey string) string {
++	return parseEntrypointFromUA(resolveOutboundClaudeUserAgent(ctx, cfg, auth, apiKey))
++}
++
+ // getWorkloadFromContext extracts workload identifier from the gin request headers.
+ func getWorkloadFromContext(ctx context.Context) string {
+ 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+@@ -1259,7 +1312,7 @@ func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version,
+ }
+ 
+ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
+-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.63", "", "")
++	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.92", "", "")
+ }
+ 
+ // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
+@@ -1375,7 +1428,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
+ 	// Skip system instructions for claude-3-5-haiku models
+ 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
+ 		billingVersion := helps.DefaultClaudeVersion(cfg)
+-		entrypoint := parseEntrypointFromUA(clientUserAgent)
++		entrypoint := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, apiKey)
+ 		workload := getWorkloadFromContext(ctx)
+ 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useExperimentalCCHSigning, billingVersion, entrypoint, workload)
+ 	}
+diff --git a/internal/runtime/executor/claude_executor_test.go b/internal/runtime/executor/claude_executor_test.go
+index 74cec0a352..ef878194bb 100644
+--- a/internal/runtime/executor/claude_executor_test.go
++++ b/internal/runtime/executor/claude_executor_test.go
+@@ -45,6 +45,18 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
+ 	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
+ }
+ 
++func newGinContextWithHeaders(t *testing.T, incoming http.Header) context.Context {
++	t.Helper()
++
++	gin.SetMode(gin.TestMode)
++	recorder := httptest.NewRecorder()
++	ginCtx, _ := gin.CreateTestContext(recorder)
++	ginReq := httptest.NewRequest(http.MethodPost, "http://localhost/v1/messages", nil)
++	ginReq.Header = incoming.Clone()
++	ginCtx.Request = ginReq
++	return context.WithValue(context.Background(), "gin", ginCtx)
++}
++
+ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVersion, runtimeVersion, osName, arch string) {
+ 	t.Helper()
+ 
+@@ -107,6 +119,55 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
+ 	}
+ }
+ 
++func TestResolveOutboundClaudeEntrypoint_UsesResolvedDefaultUserAgent(t *testing.T) {
++	resetClaudeDeviceProfileCache()
++	stabilize := true
++
++	cfg := &config.Config{
++		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
++			StabilizeDeviceProfile: &stabilize,
++		},
++	}
++	auth := &cliproxyauth.Auth{
++		ID: "auth-entrypoint-default",
++		Attributes: map[string]string{
++			"api_key": "key-entrypoint-default",
++		},
++	}
++	ctx := newGinContextWithHeaders(t, http.Header{
++		"User-Agent": []string{"curl/8.7.1"},
++	})
++
++	if got := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, "key-entrypoint-default"); got != "sdk-cli" {
++		t.Fatalf("resolveOutboundClaudeEntrypoint() = %q, want %q", got, "sdk-cli")
++	}
++}
++
++func TestResolveOutboundClaudeEntrypoint_AuthHeaderOverrideWins(t *testing.T) {
++	resetClaudeDeviceProfileCache()
++	stabilize := true
++
++	cfg := &config.Config{
++		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
++			StabilizeDeviceProfile: &stabilize,
++		},
++	}
++	auth := &cliproxyauth.Auth{
++		ID: "auth-entrypoint-override",
++		Attributes: map[string]string{
++			"api_key":           "key-entrypoint-override",
++			"header:User-Agent": "claude-cli/2.1.92 (external, vscode)",
++		},
++	}
++	ctx := newGinContextWithHeaders(t, http.Header{
++		"User-Agent": []string{"curl/8.7.1"},
++	})
++
++	if got := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, "key-entrypoint-override"); got != "vscode" {
++		t.Fatalf("resolveOutboundClaudeEntrypoint() = %q, want %q", got, "vscode")
++	}
++}
++
+ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
+ 	resetClaudeDeviceProfileCache()
+ 	stabilize := true
+@@ -169,6 +230,48 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
+ 	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.63 (external, cli)", "0.75.0", "v24.4.0", "MacOS", "arm64")
+ }
+ 
++func TestClaudeExecutor_CountTokens_BillingEntrypointMatchesResolvedUserAgent(t *testing.T) {
++	resetClaudeDeviceProfileCache()
++	stabilize := true
++	var seenBody []byte
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		seenBody = bytes.Clone(body)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"input_tokens":1}`))
++	}))
++	defer server.Close()
++
++	cfg := &config.Config{
++		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
++			StabilizeDeviceProfile: &stabilize,
++		},
++	}
++	executor := NewClaudeExecutor(cfg)
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{
++		"api_key":  "key-123",
++		"base_url": server.URL,
++	}}
++	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
++	ctx := newGinContextWithHeaders(t, http.Header{
++		"User-Agent": []string{"curl/8.7.1"},
++	})
++
++	_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
++		Model:   "claude-3-5-sonnet-20241022",
++		Payload: payload,
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
++	if err != nil {
++		t.Fatalf("CountTokens error: %v", err)
++	}
++
++	billingHeader := gjson.GetBytes(seenBody, "system.0.text").String()
++	if !strings.Contains(billingHeader, "cc_entrypoint=sdk-cli;") {
++		t.Fatalf("billing header = %q, want cc_entrypoint=sdk-cli", billingHeader)
++	}
++}
++
+ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClient(t *testing.T) {
+ 	resetClaudeDeviceProfileCache()
+ 	stabilize := true
+@@ -1332,8 +1435,8 @@ func TestClaudeExecutor_Execute_SetsCompressedAcceptEncoding(t *testing.T) {
+ 		t.Fatalf("Execute error: %v", err)
+ 	}
+ 
+-	if gotEncoding != "gzip, deflate, br, zstd" {
+-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
++	if gotEncoding != "br, gzip, deflate" {
++		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "br, gzip, deflate")
+ 	}
+ 	if gotAccept != "application/json" {
+ 		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
+diff --git a/internal/runtime/executor/helps/claude_device_profile.go b/internal/runtime/executor/helps/claude_device_profile.go
+index 154901b53b..850bafec36 100644
+--- a/internal/runtime/executor/helps/claude_device_profile.go
++++ b/internal/runtime/executor/helps/claude_device_profile.go
+@@ -16,9 +16,9 @@ import (
+ )
+ 
+ const (
+-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.63 (external, cli)"
+-	defaultClaudeFingerprintPackageVersion = "0.74.0"
+-	defaultClaudeFingerprintRuntimeVersion = "v24.3.0"
++	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.92 (external, sdk-cli)"
++	defaultClaudeFingerprintPackageVersion = "0.80.0"
++	defaultClaudeFingerprintRuntimeVersion = "v24.14.0"
+ 	defaultClaudeFingerprintOS             = "MacOS"
+ 	defaultClaudeFingerprintArch           = "arm64"
+ 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
+@@ -365,7 +365,7 @@ func DefaultClaudeVersion(cfg *config.Config) string {
+ 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
+ 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+ 	}
+-	return "2.1.63"
++	return "2.1.92"
+ }
+ 
+ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
+diff --git a/internal/runtime/executor/helps/cloak_utils.go b/internal/runtime/executor/helps/cloak_utils.go
+index 11ace54559..7720fcf186 100644
+--- a/internal/runtime/executor/helps/cloak_utils.go
++++ b/internal/runtime/executor/helps/cloak_utils.go
+@@ -9,21 +9,30 @@ import (
+ 	"github.com/google/uuid"
+ )
+ 
+-// userIDPattern matches Claude Code format: user_[64-hex]_account_[uuid]_session_[uuid]
+-var userIDPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
++// userIDPattern matches Claude Code 2.1.92+ JSON format:
++// {"device_id":"[64-hex]","account_uuid":"[uuid]","session_id":"[uuid]"}
++var userIDPattern = regexp.MustCompile(`^\{"device_id":"[a-fA-F0-9]{64}","account_uuid":"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}","session_id":"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"\}$`)
+ 
+-// generateFakeUserID generates a fake user ID in Claude Code format.
+-// Format: user_[64-hex-chars]_account_[UUID-v4]_session_[UUID-v4]
++// generateFakeUserID generates a fake user ID in Claude Code 2.1.92+ JSON format.
++// Format: {"device_id":"[64-hex]","account_uuid":"[UUID-v4]","session_id":"[UUID-v4]"}
++// Use generateFakeUserIDWithSession when you have a stable session ID to keep consistent
++// with the X-Claude-Code-Session-Id header.
+ func generateFakeUserID() string {
++	return generateFakeUserIDWithSession(uuid.New().String())
++}
++
++// generateFakeUserIDWithSession generates a fake user ID using a specific session UUID.
++// device_id and account_uuid are random; session_id matches the provided value so that
++// metadata.user_id.session_id stays consistent with X-Claude-Code-Session-Id.
++func generateFakeUserIDWithSession(sessionID string) string {
+ 	hexBytes := make([]byte, 32)
+ 	_, _ = rand.Read(hexBytes)
+-	hexPart := hex.EncodeToString(hexBytes)
++	deviceID := hex.EncodeToString(hexBytes)
+ 	accountUUID := uuid.New().String()
+-	sessionUUID := uuid.New().String()
+-	return "user_" + hexPart + "_account_" + accountUUID + "_session_" + sessionUUID
++	return `{"device_id":"` + deviceID + `","account_uuid":"` + accountUUID + `","session_id":"` + sessionID + `"}`
+ }
+ 
+-// isValidUserID checks if a user ID matches Claude Code format.
++// isValidUserID checks if a user ID matches Claude Code 2.1.92+ JSON format.
+ func isValidUserID(userID string) bool {
+ 	return userIDPattern.MatchString(userID)
+ }
+diff --git a/internal/runtime/executor/helps/user_id_cache.go b/internal/runtime/executor/helps/user_id_cache.go
+index ad41fd9a8a..e15a7d523a 100644
+--- a/internal/runtime/executor/helps/user_id_cache.go
++++ b/internal/runtime/executor/helps/user_id_cache.go
+@@ -75,7 +75,7 @@ func CachedUserID(apiKey string) string {
+ 		userIDCacheMu.Unlock()
+ 	}
+ 
+-	newID := generateFakeUserID()
++	newID := generateFakeUserIDWithSession(CachedSessionID(apiKey))
+ 
+ 	userIDCacheMu.Lock()
+ 	entry, ok = userIDCache[key]
