@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1785,8 +1786,8 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 	content := gjson.GetBytes(payload, contentPath)
 
 	if content.IsArray() {
-		newBlock := fmt.Sprintf(`{"type":"text","text":%q}`, prefixBlock)
 		var newArray string
+		newBlock := fmt.Sprintf(`{"type":"text","text":%q,"cache_control":{"type":"ephemeral"}}`, prefixBlock)
 		if content.Raw == "[]" || content.Raw == "" {
 			newArray = "[" + newBlock + "]"
 		} else {
@@ -1794,8 +1795,20 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 		}
 		payload, _ = sjson.SetRawBytes(payload, contentPath, []byte(newArray))
 	} else if content.Type == gjson.String {
-		newText := prefixBlock + content.String()
-		payload, _ = sjson.SetBytes(payload, contentPath, newText)
+		newContent := []map[string]any{
+			{
+				"type": "text",
+				"text": prefixBlock,
+				"cache_control": map[string]string{
+					"type": "ephemeral",
+				},
+			},
+			{
+				"type": "text",
+				"text": content.String(),
+			},
+		}
+		payload, _ = sjson.SetBytes(payload, contentPath, newContent)
 	}
 
 	return payload

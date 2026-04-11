@@ -1959,6 +1959,23 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 `, text)
 }
 
+func assertPrependedReminderBlock(t *testing.T, out []byte, reminderText, userText string) {
+	t.Helper()
+
+	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 2 {
+		t.Fatalf("messages.0.content length = %d, want 2", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("messages.0.content.0.cache_control.type = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder(reminderText) {
+		t.Fatalf("messages.0.content.0.text = %q, want forwarded reminder", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != userText {
+		t.Fatalf("messages.0.content.1.text = %q, want %q", got, userText)
+	}
+}
+
 // Test case 1: String system prompt is preserved by forwarding it to the first user message
 func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
@@ -1999,9 +2016,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[4].Get("text").String() != expectedClaudeCodeDoingTasksPrompt() {
 		t.Fatalf("blocks[4] should be doing tasks block, got %q", blocks[4].Get("text").String())
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {
-		t.Fatalf("messages[0].content should include forwarded system prompt, got %q", got)
-	}
+	assertPrependedReminderBlock(t, out, "You are a helpful assistant.", "hi")
 }
 
 // Test case 2: Strict mode keeps the injected Claude Code system blocks only
@@ -2044,9 +2059,7 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	if len(blocks) != 5 {
 		t.Fatalf("expected 5 system blocks, got %d", len(blocks))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("Be concise.")+"hi" {
-		t.Fatalf("messages[0].content should include forwarded array system prompt, got %q", got)
-	}
+	assertPrependedReminderBlock(t, out, "Be concise.", "hi")
 }
 
 // Test case 5: Special characters in string system prompt survive forwarding
@@ -2059,9 +2072,7 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	if len(blocks) != 5 {
 		t.Fatalf("expected 5 system blocks, got %d", len(blocks))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder(`Use <xml> tags & "quotes" in output.`)+"hi" {
-		t.Fatalf("forwarded system prompt text mangled, got %q", got)
-	}
+	assertPrependedReminderBlock(t, out, `Use <xml> tags & "quotes" in output.`, "hi")
 }
 
 func TestCheckSystemInstructionsWithMode_UsesConfiguredClaudeVersion(t *testing.T) {
@@ -2114,9 +2125,7 @@ func TestCheckSystemInstructionsWithMode_EscapesConfiguredClaudeVersion(t *testi
 	if got := system[4].Get("text").String(); got != expectedClaudeCodeDoingTasksPrompt() {
 		t.Fatalf("system[4] should remain the doing tasks block, got %q", got)
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {
-		t.Fatalf("messages[0].content should include forwarded system prompt, got %q", got)
-	}
+	assertPrependedReminderBlock(t, out, "You are a helpful assistant.", "hi")
 }
 
 func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader(t *testing.T) {
