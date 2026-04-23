@@ -143,6 +143,51 @@ func (m *authTabModel) startEdit(fieldIdx int) tea.Cmd {
 	return textinput.Blink
 }
 
+func (m authTabModel) toggleClaudeField(field string) tea.Cmd {
+	if m.cursor >= len(m.files) {
+		return nil
+	}
+
+	f := m.files[m.cursor]
+	if !authFileSupportsClaudeCloak(f) {
+		return func() tea.Msg {
+			return authActionMsg{err: fmt.Errorf("%s", T("auth_cloak_only"))}
+		}
+	}
+
+	fileName := getString(f, "name")
+	cloakMode := authFileCloakMode(f)
+	fields := map[string]any{}
+	fieldLabel := field
+
+	switch field {
+	case "cloak":
+		if cloakMode == "never" {
+			fields["cloak_mode"] = "auto"
+		} else {
+			fields["cloak_mode"] = "never"
+		}
+	case "strict mode":
+		fields["cloak_strict_mode"] = !authFileBoolValue(f, "cloak_strict_mode")
+	case "everything":
+		if cloakMode == "always" {
+			fields["cloak_mode"] = "auto"
+		} else {
+			fields["cloak_mode"] = "always"
+		}
+	default:
+		return nil
+	}
+
+	return func() tea.Msg {
+		err := m.client.PatchAuthFileFields(fileName, fields)
+		if err != nil {
+			return authActionMsg{err: err}
+		}
+		return authActionMsg{action: fmt.Sprintf(T("updated_field"), fieldLabel, fileName)}
+	}
+}
+
 func (m *authTabModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
@@ -267,27 +312,64 @@ func (m authTabModel) renderDetail(f map[string]any) string {
 
 	fields := []struct {
 		label    string
-		key      string
+		value    string
 		editable bool
 	}{
-		{"Name", "name", false},
-		{"Channel", "channel", false},
-		{"Email", "email", false},
-		{"Status", "status", false},
-		{"Status Msg", "status_message", false},
-		{"File Name", "file_name", false},
-		{"Auth Type", "auth_type", false},
-		{"Prefix", "prefix", true},
-		{"Proxy URL", "proxy_url", true},
-		{"Priority", "priority", true},
-		{"Project ID", "project_id", false},
-		{"Disabled", "disabled", false},
-		{"Created", "created_at", false},
-		{"Updated", "updated_at", false},
+		{"Name", getAnyString(f, "name"), false},
+		{"Channel", getAnyString(f, "channel"), false},
+		{"Email", getAnyString(f, "email"), false},
+		{"Status", getAnyString(f, "status"), false},
+		{"Status Msg", getAnyString(f, "status_message"), false},
+		{"File Name", getAnyString(f, "name"), false},
+		{"Auth Type", firstNonEmpty(getAnyString(f, "auth_type"), getAnyString(f, "provider"), getAnyString(f, "type")), false},
+		{"Prefix", getAnyString(f, "prefix"), true},
+		{"Proxy URL", getAnyString(f, "proxy_url"), true},
+		{"Priority", getAnyString(f, "priority"), true},
 	}
+	if authFileSupportsClaudeCloak(f) {
+		fields = append(fields,
+			struct {
+				label    string
+				value    string
+				editable bool
+			}{"Cloak", authToggleValue(authFileCloakMode(f) != "never"), true},
+			struct {
+				label    string
+				value    string
+				editable bool
+			}{"Strict Mode", authToggleValue(authFileBoolValue(f, "cloak_strict_mode")), true},
+			struct {
+				label    string
+				value    string
+				editable bool
+			}{"Everything", authToggleValue(authFileCloakMode(f) == "always"), true},
+		)
+	}
+	fields = append(fields,
+		struct {
+			label    string
+			value    string
+			editable bool
+		}{"Project ID", getAnyString(f, "project_id"), false},
+		struct {
+			label    string
+			value    string
+			editable bool
+		}{"Disabled", getAnyString(f, "disabled"), false},
+		struct {
+			label    string
+			value    string
+			editable bool
+		}{"Created", getAnyString(f, "created_at"), false},
+		struct {
+			label    string
+			value    string
+			editable bool
+		}{"Updated", getAnyString(f, "updated_at"), false},
+	)
 
 	for _, field := range fields {
-		val := getAnyString(f, field.key)
+		val := field.value
 		if val == "" || val == "<nil>" {
 			if field.editable {
 				val = T("not_set")
@@ -318,6 +400,54 @@ func getAnyString(m map[string]any, key string) string {
 		return ""
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func authFileSupportsClaudeCloak(f map[string]any) bool {
+	provider := strings.ToLower(strings.TrimSpace(getAnyString(f, "provider")))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(getAnyString(f, "type")))
+	}
+	return provider == "claude" || provider == "anthropic"
+}
+
+func authFileCloakMode(f map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(getAnyString(f, "cloak_mode"))) {
+	case "always", "full":
+		return "always"
+	case "never", "off", "false", "disabled":
+		return "never"
+	default:
+		return "auto"
+	}
+}
+
+func authFileBoolValue(f map[string]any, key string) bool {
+	v, ok := f[key]
+	if !ok || v == nil {
+		return false
+	}
+	switch value := v.(type) {
+	case bool:
+		return value
+	default:
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", value)), "true")
+	}
+}
+
+func authToggleValue(enabled bool) string {
+	if enabled {
+		return T("bool_yes")
+	}
+	return T("bool_no")
 }
 
 func max(a, b int) int {
@@ -445,6 +575,12 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 		return m, m.startEdit(1) // proxy_url
 	case "3":
 		return m, m.startEdit(2) // priority
+	case "4":
+		return m, m.toggleClaudeField("cloak")
+	case "5":
+		return m, m.toggleClaudeField("strict mode")
+	case "6":
+		return m, m.toggleClaudeField("everything")
 	case "r":
 		m.status = ""
 		return m, m.fetchFiles
