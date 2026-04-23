@@ -332,6 +332,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				typeValue := gjson.GetBytes(data, "type").String()
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
+				fileData["provider"] = typeValue
 				fileData["email"] = emailValue
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
@@ -347,6 +348,17 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
 						fileData["note"] = trimmed
 					}
+				}
+				providerValue := strings.ToLower(strings.TrimSpace(typeValue))
+				if providerValue == "anthropic" {
+					providerValue = "claude"
+				}
+				if providerValue == "claude" {
+					cloakMode := normalizeCloakMode(gjson.GetBytes(data, "cloak_mode").String())
+					fileData["cloak_mode"] = cloakMode
+					fileData["cloak_enabled"] = cloakMode != "never"
+					fileData["cloak_everything"] = cloakMode == "always"
+					fileData["cloak_strict_mode"] = parseBoolValue(gjson.GetBytes(data, "cloak_strict_mode").Value())
 				}
 			}
 
@@ -462,6 +474,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	if authSupportsClaudeCloak(auth) {
+		cloakMode := normalizeCloakMode(authStringValue(auth, "cloak_mode"))
+		entry["cloak_mode"] = cloakMode
+		entry["cloak_enabled"] = cloakMode != "never"
+		entry["cloak_everything"] = cloakMode == "always"
+		entry["cloak_strict_mode"] = authBoolValue(auth, "cloak_strict_mode")
+	}
 	return entry
 }
 
@@ -530,6 +549,66 @@ func authAttribute(auth *coreauth.Auth, key string) string {
 		return ""
 	}
 	return auth.Attributes[key]
+}
+
+func authSupportsClaudeCloak(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	return provider == "claude" || provider == "anthropic"
+}
+
+func authStringValue(auth *coreauth.Auth, key string) string {
+	if auth == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(authAttribute(auth, key)); v != "" {
+		return v
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata[key]; ok {
+			return strings.TrimSpace(fmt.Sprintf("%v", raw))
+		}
+	}
+	return ""
+}
+
+func authBoolValue(auth *coreauth.Auth, key string) bool {
+	if auth == nil {
+		return false
+	}
+	if v := strings.TrimSpace(authAttribute(auth, key)); v != "" {
+		return parseBoolValue(v)
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata[key]; ok {
+			return parseBoolValue(raw)
+		}
+	}
+	return false
+}
+
+func parseBoolValue(raw any) bool {
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", raw)), "true")
+	}
+}
+
+func normalizeCloakMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "always", "full":
+		return "always"
+	case "never", "off", "false", "disabled":
+		return "never"
+	default:
+		return "auto"
+	}
 }
 
 func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
@@ -1118,7 +1197,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note, Claude cloak flags) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1126,12 +1205,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
+		Name            string            `json:"name"`
+		Prefix          *string           `json:"prefix"`
+		ProxyURL        *string           `json:"proxy_url"`
+		Headers         map[string]string `json:"headers"`
+		Priority        *int              `json:"priority"`
+		Note            *string           `json:"note"`
+		CloakMode       *string           `json:"cloak_mode"`
+		CloakStrictMode *bool             `json:"cloak_strict_mode"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1293,6 +1374,30 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			} else {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
+			}
+		}
+		changed = true
+	}
+	if req.CloakMode != nil || req.CloakStrictMode != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
+		}
+
+		if req.CloakMode != nil {
+			cloakMode := normalizeCloakMode(*req.CloakMode)
+			targetAuth.Metadata["cloak_mode"] = cloakMode
+			targetAuth.Attributes["cloak_mode"] = cloakMode
+		}
+		if req.CloakStrictMode != nil {
+			if *req.CloakStrictMode {
+				targetAuth.Metadata["cloak_strict_mode"] = true
+				targetAuth.Attributes["cloak_strict_mode"] = "true"
+			} else {
+				delete(targetAuth.Metadata, "cloak_strict_mode")
+				delete(targetAuth.Attributes, "cloak_strict_mode")
 			}
 		}
 		changed = true

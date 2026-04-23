@@ -162,3 +162,60 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 		t.Fatalf("metadata.headers.X-Kee = %#v, want %q", got, "1")
 	}
 }
+
+func TestPatchAuthFileFields_UpdatesClaudeCloakMetadata(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "cloak.json",
+		FileName: "cloak.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path":              "/tmp/cloak.json",
+			"cloak_mode":        "never",
+			"cloak_strict_mode": "true",
+		},
+		Metadata: map[string]any{
+			"type":              "claude",
+			"cloak_mode":        "never",
+			"cloak_strict_mode": true,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"cloak.json","cloak_mode":"always","cloak_strict_mode":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("cloak.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["cloak_mode"]; got != "always" {
+		t.Fatalf("attrs cloak_mode = %q, want %q", got, "always")
+	}
+	if _, ok := updated.Attributes["cloak_strict_mode"]; ok {
+		t.Fatalf("expected attrs cloak_strict_mode to be deleted when false")
+	}
+	if got, _ := updated.Metadata["cloak_mode"].(string); got != "always" {
+		t.Fatalf("metadata.cloak_mode = %q, want %q", got, "always")
+	}
+	if _, ok := updated.Metadata["cloak_strict_mode"]; ok {
+		t.Fatalf("expected metadata.cloak_strict_mode to be deleted when false")
+	}
+}
