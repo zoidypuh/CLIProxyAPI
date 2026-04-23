@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"golang.org/x/net/proxy"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
 func TestNewClaudeAuthWithProxyURL_OverrideDirectTakesPrecedence(t *testing.T) {
@@ -15,8 +15,11 @@ func TestNewClaudeAuthWithProxyURL_OverrideDirectTakesPrecedence(t *testing.T) {
 	if !ok || transport == nil {
 		t.Fatalf("expected utlsRoundTripper, got %T", auth.httpClient.Transport)
 	}
-	if transport.dialer != proxy.Direct {
-		t.Fatalf("expected proxy.Direct, got %T", transport.dialer)
+	if transport.dialer == nil {
+		t.Fatal("expected proxy dialer to be initialized")
+	}
+	if transport.dialer.proxyMode != proxyutil.ModeDirect {
+		t.Fatalf("expected direct proxy mode, got %v", transport.dialer.proxyMode)
 	}
 }
 
@@ -27,7 +30,10 @@ func TestNewClaudeAuthWithProxyURL_OverrideProxyAppliedWithoutConfig(t *testing.
 	if !ok || transport == nil {
 		t.Fatalf("expected utlsRoundTripper, got %T", auth.httpClient.Transport)
 	}
-	if transport.dialer == proxy.Direct {
-		t.Fatalf("expected proxy dialer, got %T", transport.dialer)
+	if transport.dialer == nil {
+		t.Fatal("expected proxy dialer to be initialized")
+	}
+	if transport.dialer.proxyMode != proxyutil.ModeProxy {
+		t.Fatalf("expected explicit proxy mode, got %v", transport.dialer.proxyMode)
 	}
 }

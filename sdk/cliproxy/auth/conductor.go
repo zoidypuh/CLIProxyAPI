@@ -3401,8 +3401,8 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		return
 	}
 	now := time.Now()
+	shouldReschedule := false
 	if err != nil {
-		shouldReschedule := false
 		log.Warnf("auth refresh failed for %s/%s: %v", auth.Provider, auth.ID, err)
 	} else {
 		log.Debugf("auth refresh ok for %s/%s", auth.Provider, auth.ID)

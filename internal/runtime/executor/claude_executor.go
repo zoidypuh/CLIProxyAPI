@@ -582,6 +582,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 			body,
 			false,
 			false,
+			false,
 			helps.DefaultClaudeVersion(e.cfg),
 			resolveOutboundClaudeEntrypoint(ctx, e.cfg, auth, apiKey),
 			"",

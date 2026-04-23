@@ -2001,7 +2001,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[1].Get("cache_control.scope").String() != "org" {
 		t.Fatalf("blocks[1] should have cache_control.scope=org, got %q", blocks[1].Get("cache_control.scope").String())
 	}
-	if blocks[2].Get("cache_control").Exists() {
+	if !blocks[2].Get("cache_control").Exists() {
 		t.Fatalf("blocks[2] should have cache_control, got %s", blocks[2].Get("cache_control").Raw)
 	}
 	if blocks[2].Get("text").String() != helps.ClaudeCodeIntro {
