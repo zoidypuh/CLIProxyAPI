@@ -18,30 +18,16 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func removeQueryValuesMatching(req *http.Request, key string, match string) {
-	if req == nil || req.URL == nil || match == "" {
+func removeQueryKey(req *http.Request, key string) {
+	if req == nil || req.URL == nil {
 		return
 	}
 
 	q := req.URL.Query()
-	values, ok := q[key]
-	if !ok || len(values) == 0 {
+	if _, ok := q[key]; !ok {
 		return
 	}
-
-	kept := make([]string, 0, len(values))
-	for _, v := range values {
-		if v == match {
-			continue
-		}
-		kept = append(kept, v)
-	}
-
-	if len(kept) == 0 {
-		q.Del(key)
-	} else {
-		q[key] = kept
-	}
+	q.Del(key)
 	req.URL.RawQuery = q.Encode()
 }
 
@@ -80,12 +66,9 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		// Remove proxy, client identity, and browser fingerprint headers
 		misc.ScrubProxyAndFingerprintHeaders(req)
 
-		// Remove query-based credentials if they match the authenticated client API key.
-		// This prevents leaking client auth material to the Amp upstream while avoiding
-		// breaking unrelated upstream query parameters.
-		clientKey := getClientAPIKeyFromContext(req.Context())
-		removeQueryValuesMatching(req, "key", clientKey)
-		removeQueryValuesMatching(req, "auth_token", clientKey)
+		// Remove query-based credentials before proxying upstream.
+		removeQueryKey(req, "key")
+		removeQueryKey(req, "auth_token")
 
 		// Preserve correlation headers for debugging
 		if req.Header.Get("X-Request-ID") == "" {

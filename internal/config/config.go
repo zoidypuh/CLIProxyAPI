@@ -186,7 +186,7 @@ type PprofConfig struct {
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
 	AllowRemote bool `yaml:"allow-remote"`
-	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
+	// SecretKey is a legacy no-op field retained so older config files still parse.
 	SecretKey string `yaml:"secret-key"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
@@ -274,9 +274,7 @@ type AmpCode struct {
 	// UpstreamAPIKey optionally overrides the Authorization header when proxying Amp upstream calls.
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
-	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
-	// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
-	// is used for the upstream Amp request.
+	// UpstreamAPIKeys is a legacy no-op field retained so older config files still parse.
 	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys,omitempty" json:"upstream-api-keys,omitempty"`
 
 	// RestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
@@ -294,14 +292,12 @@ type AmpCode struct {
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
 }
 
-// AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.
-// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
-// is used for the upstream Amp request.
+// AmpUpstreamAPIKeyEntry is a legacy no-op mapping entry retained for compatibility.
 type AmpUpstreamAPIKeyEntry struct {
-	// UpstreamAPIKey is the API key to use when proxying to the Amp upstream.
+	// UpstreamAPIKey is ignored.
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
-	// APIKeys are the client API keys (from top-level api-keys) that map to this upstream key.
+	// APIKeys is ignored.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 }
 
@@ -654,20 +650,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// 		cfg.legacyMigrationPending = true
 	// 	}
 	// }
-
-	// Hash remote management key if plaintext is detected (nested)
-	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
-	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
-		hashed, errHash := hashSecret(cfg.RemoteManagement.SecretKey)
-		if errHash != nil {
-			return nil, fmt.Errorf("failed to hash remote management key: %w", errHash)
-		}
-		cfg.RemoteManagement.SecretKey = hashed
-
-		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
-		// Preserve YAML comments and ordering; update only the nested key.
-		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
-	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {

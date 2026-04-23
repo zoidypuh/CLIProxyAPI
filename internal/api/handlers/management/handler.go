@@ -3,12 +3,9 @@
 package management
 
 import (
-	"crypto/subtle"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +15,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type attemptInfo struct {
@@ -35,35 +31,29 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
+	cfg            *config.Config
+	configFilePath string
+	mu             sync.Mutex
+	attemptsMu     sync.Mutex
+	failedAttempts map[string]*attemptInfo // keyed by client IP
+	authManager    *coreauth.Manager
+	usageStats     *usage.RequestStatistics
+	tokenStore     coreauth.Store
+	localPassword  string
+	logDir         string
+	postAuthHook   coreauth.PostAuthHook
 }
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
-	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
-	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		usageStats:          usage.GetRequestStatistics(),
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
+		cfg:            cfg,
+		configFilePath: configFilePath,
+		failedAttempts: make(map[string]*attemptInfo),
+		authManager:    manager,
+		usageStats:     usage.GetRequestStatistics(),
+		tokenStore:     sdkAuth.GetTokenStore(),
 	}
 	h.startAttemptCleanup()
 	return h
@@ -127,9 +117,6 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
-// SetLocalPassword configures the runtime-local password accepted for localhost requests.
-func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
-
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
 	if dir == "" {
@@ -149,8 +136,7 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 }
 
 // Middleware enforces access control for management endpoints.
-// All requests (local and remote) require a valid management key.
-// Additionally, remote access requires allow-remote-management=true.
+// Local requests are allowed. Remote access requires allow-remote-management=true.
 func (h *Handler) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
@@ -159,129 +145,49 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
+		cfg := h.cfg
+		var (
+			allowRemote bool
+		)
+		if cfg != nil {
+			allowRemote = cfg.RemoteManagement.AllowRemote
+		}
 
-		// Accept either Authorization: Bearer <key> or X-Management-Key
-		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
-			parts := strings.SplitN(ah, " ", 2)
-			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-				provided = parts[1]
-			} else {
-				provided = ah
+		if !localClient {
+			h.attemptsMu.Lock()
+			ai := h.failedAttempts[clientIP]
+			if ai != nil {
+				if !ai.blockedUntil.IsZero() {
+					if time.Now().Before(ai.blockedUntil) {
+						remaining := time.Until(ai.blockedUntil).Round(time.Second)
+						h.attemptsMu.Unlock()
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)})
+						return
+					}
+					// Ban expired, reset state
+					ai.blockedUntil = time.Time{}
+					ai.count = 0
+				}
+			}
+			h.attemptsMu.Unlock()
+
+			if !allowRemote {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+				return
 			}
 		}
-		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
+
+		if !localClient {
+			h.attemptsMu.Lock()
+			if ai := h.failedAttempts[clientIP]; ai != nil {
+				ai.count = 0
+				ai.blockedUntil = time.Time{}
+			}
+			h.attemptsMu.Unlock()
 		}
 
-		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
-		if !allowed {
-			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
-			return
-		}
 		c.Next()
 	}
-}
-
-// AuthenticateManagementKey verifies the provided management key for the given client.
-// It mirrors the behaviour of Middleware() so non-HTTP callers can reuse the same logic.
-func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
-	const maxFailures = 5
-	const banDuration = 30 * time.Minute
-
-	if h == nil {
-		return false, http.StatusForbidden, "remote management disabled"
-	}
-
-	cfg := h.cfg
-	var (
-		allowRemote bool
-		secretHash  string
-	)
-	if cfg != nil {
-		allowRemote = cfg.RemoteManagement.AllowRemote
-		secretHash = cfg.RemoteManagement.SecretKey
-	}
-	if h.allowRemoteOverride {
-		allowRemote = true
-	}
-	envSecret := h.envSecret
-
-	now := time.Now()
-	h.attemptsMu.Lock()
-	ai := h.failedAttempts[clientIP]
-	if ai != nil && !ai.blockedUntil.IsZero() {
-		if now.Before(ai.blockedUntil) {
-			remaining := ai.blockedUntil.Sub(now).Round(time.Second)
-			h.attemptsMu.Unlock()
-			return false, http.StatusForbidden, fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)
-		}
-		// Ban expired, reset state
-		ai.blockedUntil = time.Time{}
-		ai.count = 0
-	}
-	h.attemptsMu.Unlock()
-
-	if !localClient && !allowRemote {
-		return false, http.StatusForbidden, "remote management disabled"
-	}
-
-	fail := func() {
-		h.attemptsMu.Lock()
-		aip := h.failedAttempts[clientIP]
-		if aip == nil {
-			aip = &attemptInfo{}
-			h.failedAttempts[clientIP] = aip
-		}
-		aip.count++
-		aip.lastActivity = time.Now()
-		if aip.count >= maxFailures {
-			aip.blockedUntil = time.Now().Add(banDuration)
-			aip.count = 0
-		}
-		h.attemptsMu.Unlock()
-	}
-
-	reset := func() {
-		h.attemptsMu.Lock()
-		if ai := h.failedAttempts[clientIP]; ai != nil {
-			ai.count = 0
-			ai.blockedUntil = time.Time{}
-		}
-		h.attemptsMu.Unlock()
-	}
-
-	if secretHash == "" && envSecret == "" {
-		return false, http.StatusForbidden, "remote management key not set"
-	}
-
-	if provided == "" {
-		fail()
-		return false, http.StatusUnauthorized, "missing management key"
-	}
-
-	if localClient {
-		if lp := h.localPassword; lp != "" {
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
-				reset()
-				return true, 0, ""
-			}
-		}
-	}
-
-	if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {
-		reset()
-		return true, 0, ""
-	}
-
-	if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
-		fail()
-		return false, http.StatusUnauthorized, "invalid management key"
-	}
-
-	reset()
-
-	return true, 0, ""
 }
 
 // persist saves the current in-memory config to disk.

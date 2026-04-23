@@ -7,13 +7,11 @@
 
 # Hidden feature: Preserve usage statistics across rebuilds
 # Usage: ./docker-build.sh --with-usage
-# First run prompts for management API key, saved to temp/stats/.api_secret
 
 set -euo pipefail
 
 STATS_DIR="temp/stats"
 STATS_FILE="${STATS_DIR}/.usage_backup.json"
-SECRET_FILE="${STATS_DIR}/.api_secret"
 WITH_USAGE=false
 
 get_port() {
@@ -21,21 +19,6 @@ get_port() {
     grep -E "^port:" config.yaml | sed -E 's/^port: *["'"'"']?([0-9]+)["'"'"']?.*$/\1/'
   else
     echo "8317"
-  fi
-}
-
-export_stats_api_secret() {
-  if [[ -f "${SECRET_FILE}" ]]; then
-    API_SECRET=$(cat "${SECRET_FILE}")
-  else
-    if [[ ! -d "${STATS_DIR}" ]]; then
-      mkdir -p "${STATS_DIR}"
-    fi
-    echo "First time using --with-usage. Management API key required."
-    read -r -p "Enter management key: " -s API_SECRET
-    echo
-    echo "${API_SECRET}" > "${SECRET_FILE}"
-    chmod 600 "${SECRET_FILE}"
   fi
 }
 
@@ -59,7 +42,7 @@ export_stats() {
   fi
   check_container_running
   echo "Exporting usage statistics..."
-  EXPORT_RESPONSE=$(curl -s -w "\n%{http_code}" -H "X-Management-Key: ${API_SECRET}" \
+  EXPORT_RESPONSE=$(curl -s -w "\n%{http_code}" \
     "http://localhost:${port}/v0/management/usage/export")
   HTTP_CODE=$(echo "${EXPORT_RESPONSE}" | tail -n1)
   RESPONSE_BODY=$(echo "${EXPORT_RESPONSE}" | sed '$d')
@@ -79,7 +62,6 @@ import_stats() {
 
   echo "Importing usage statistics..."
   IMPORT_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-    -H "X-Management-Key: ${API_SECRET}" \
     -H "Content-Type: application/json" \
     -d @"${STATS_FILE}" \
     "http://localhost:${port}/v0/management/usage/import")
@@ -114,7 +96,6 @@ case "${1:-}" in
     ;;
   "--with-usage")
     WITH_USAGE=true
-    export_stats_api_secret
     ;;
   *)
     echo "Error: unknown option '${1}'. Did you mean '--with-usage'?"

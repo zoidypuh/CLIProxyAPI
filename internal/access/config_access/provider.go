@@ -11,21 +11,8 @@ import (
 
 // Register ensures the config-access provider is available to the access manager.
 func Register(cfg *sdkconfig.SDKConfig) {
-	if cfg == nil {
-		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
-		return
-	}
-
-	keys := normalizeKeys(cfg.APIKeys)
-	if len(keys) == 0 {
-		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
-		return
-	}
-
-	sdkaccess.RegisterProvider(
-		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
-	)
+	_ = cfg
+	sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 }
 
 type provider struct {

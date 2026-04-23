@@ -14,13 +14,8 @@ tls:
 # Management API settings
 remote-management:
   # Whether to allow remote (non-localhost) management access.
-  # When false, only localhost can access management endpoints (a key is still required).
+  # When false, only localhost can access management endpoints.
   allow-remote: false
-
-  # Management key. If a plaintext value is provided here, it will be hashed on startup.
-  # All management requests (even from localhost) require this key.
-  # Leave empty to disable the Management API entirely (404 for all /v0/management routes).
-  secret-key: ""
 
   # Disable the bundled management control panel asset download and HTTP route when true.
   disable-control-panel: false
@@ -34,12 +29,6 @@ remote-management:
 
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
-
-# API keys for authentication
-api-keys:
-  - "your-api-key-1"
-  - "your-api-key-2"
-  - "your-api-key-3"
 
 # Enable debug logging
 debug: false
@@ -287,18 +276,6 @@ nonstream-keepalive-interval: 0
 #   upstream-url: "https://ampcode.com"
 #   # Optional: Override API key for Amp upstream (otherwise uses env or file)
 #   upstream-api-key: ""
-#   # Per-client upstream API key mapping
-#   # Maps client API keys (from top-level api-keys) to different Amp upstream API keys.
-#   # Useful when different clients need to use different Amp accounts/quotas.
-#   # If a client key isn't mapped, falls back to upstream-api-key (default behavior).
-#   upstream-api-keys:
-#     - upstream-api-key: "amp_key_for_team_a"    # Upstream key to use for these clients
-#       api-keys:                                 # Client keys that use this upstream key
-#         - "your-api-key-1"
-#         - "your-api-key-2"
-#     - upstream-api-key: "amp_key_for_team_b"
-#       api-keys:
-#         - "your-api-key-3"
 #   # Restrict Amp management routes (/api/auth, /api/user, etc.) to localhost only (default: false)
 #   restrict-management-to-localhost: false
 #   # Force model mappings to run before checking local API keys (default: false)

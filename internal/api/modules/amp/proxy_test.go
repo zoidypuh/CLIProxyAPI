@@ -10,8 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 // Helper: compress data with gzip
@@ -329,9 +327,7 @@ func TestReverseProxy_StripsClientCredentialsFromHeadersAndQuery(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate clientAPIKeyMiddleware injection (per-request)
-		ctx := context.WithValue(r.Context(), clientAPIKeyContextKey{}, "client-key")
-		proxy.ServeHTTP(w, r.WithContext(ctx))
+		proxy.ServeHTTP(w, r)
 	}))
 	defer srv.Close()
 
@@ -364,102 +360,12 @@ func TestReverseProxy_StripsClientCredentialsFromHeadersAndQuery(t *testing.T) {
 		t.Fatalf("X-Api-Key should be upstream-injected, got: %q", v)
 	}
 
-	// Query-based credentials should be stripped only when they match the authenticated client key.
-	// Should keep unrelated values and parameters.
-	if strings.Contains(c.query, "auth_token=client-key") || strings.Contains(c.query, "key=client-key") {
+	// Query-based credentials should be stripped before proxying upstream.
+	if strings.Contains(c.query, "auth_token=") || strings.Contains(c.query, "key=") {
 		t.Fatalf("query credentials should be stripped, got raw query: %q", c.query)
 	}
-	if !strings.Contains(c.query, "key=keep") || !strings.Contains(c.query, "foo=bar") {
+	if !strings.Contains(c.query, "foo=bar") {
 		t.Fatalf("expected query to keep non-credential params, got raw query: %q", c.query)
-	}
-}
-
-func TestReverseProxy_InjectsMappedSecret_FromRequestContext(t *testing.T) {
-	gotHeaders := make(chan http.Header, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeaders <- r.Header.Clone()
-		w.WriteHeader(200)
-		w.Write([]byte(`ok`))
-	}))
-	defer upstream.Close()
-
-	defaultSource := NewStaticSecretSource("default")
-	mapped := NewMappedSecretSource(defaultSource)
-	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{
-		{
-			UpstreamAPIKey: "u1",
-			APIKeys:        []string{"k1"},
-		},
-	})
-
-	proxy, err := createReverseProxy(upstream.URL, mapped)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate clientAPIKeyMiddleware injection (per-request)
-		ctx := context.WithValue(r.Context(), clientAPIKeyContextKey{}, "k1")
-		proxy.ServeHTTP(w, r.WithContext(ctx))
-	}))
-	defer srv.Close()
-
-	res, err := http.Get(srv.URL + "/test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res.Body.Close()
-
-	hdr := <-gotHeaders
-	if hdr.Get("X-Api-Key") != "u1" {
-		t.Fatalf("X-Api-Key missing or wrong, got: %q", hdr.Get("X-Api-Key"))
-	}
-	if hdr.Get("Authorization") != "Bearer u1" {
-		t.Fatalf("Authorization missing or wrong, got: %q", hdr.Get("Authorization"))
-	}
-}
-
-func TestReverseProxy_MappedSecret_FallsBackToDefault(t *testing.T) {
-	gotHeaders := make(chan http.Header, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeaders <- r.Header.Clone()
-		w.WriteHeader(200)
-		w.Write([]byte(`ok`))
-	}))
-	defer upstream.Close()
-
-	defaultSource := NewStaticSecretSource("default")
-	mapped := NewMappedSecretSource(defaultSource)
-	mapped.UpdateMappings([]config.AmpUpstreamAPIKeyEntry{
-		{
-			UpstreamAPIKey: "u1",
-			APIKeys:        []string{"k1"},
-		},
-	})
-
-	proxy, err := createReverseProxy(upstream.URL, mapped)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), clientAPIKeyContextKey{}, "k2")
-		proxy.ServeHTTP(w, r.WithContext(ctx))
-	}))
-	defer srv.Close()
-
-	res, err := http.Get(srv.URL + "/test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res.Body.Close()
-
-	hdr := <-gotHeaders
-	if hdr.Get("X-Api-Key") != "default" {
-		t.Fatalf("X-Api-Key fallback missing or wrong, got: %q", hdr.Get("X-Api-Key"))
-	}
-	if hdr.Get("Authorization") != "Bearer default" {
-		t.Fatalf("Authorization fallback missing or wrong, got: %q", hdr.Get("Authorization"))
 	}
 }
 
