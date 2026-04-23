@@ -668,6 +668,8 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
+	managementasset.EnsureNoKeyManagementHTML(filePath)
+	c.Header("Cache-Control", "no-store")
 	c.File(filePath)
 }
 

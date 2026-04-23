@@ -191,6 +191,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return false
 	}
 	localPath := filepath.Join(staticDir, managementAssetName)
+	EnsureNoKeyManagementHTML(localPath)
 	if pinnedManagementAsset(localPath) {
 		if _, err := os.Stat(localPath); err == nil {
 			log.Debug("management asset sync skipped: pinned local asset is present")
@@ -289,8 +290,61 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return nil, nil
 	})
 
+	EnsureNoKeyManagementHTML(localPath)
 	_, err := os.Stat(localPath)
 	return err == nil
+}
+
+// EnsureNoKeyManagementHTML patches older downloaded management panels so they
+// remain compatible with keyless local management endpoints.
+func EnsureNoKeyManagementHTML(localPath string) {
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return
+	}
+
+	content := string(data)
+	patched := content
+	replacements := map[string]string{
+		`if(!b.trim()){J(t("login.error_required"));return}`:                           `if(false&&!b.trim()){J(t("login.error_required"));return}`,
+		`remember_password_label:"Remember password"`:                                  `remember_password_label:"Remember connection"`,
+		`management_key_label:"Management Key:"`:                                       `management_key_label:"Management Access:"`,
+		`management_key_placeholder:"Enter the management key"`:                        `management_key_placeholder:"No password required"`,
+		`error_invalid:"Connection failed, please check address and key"`:              `error_invalid:"Connection failed, please check address"`,
+		`error_unauthorized:"Authentication failed, invalid management key"`:           `error_unauthorized:"Authentication failed"`,
+		`remember_password_label:"记住密码"`:                                               `remember_password_label:"记住连接"`,
+		`management_key_label:"管理密钥:"`:                                                 `management_key_label:"管理访问:"`,
+		`management_key_placeholder:"请输入管理密钥"`:                                         `management_key_placeholder:"无需密码"`,
+		`error_invalid:"连接失败，请检查地址和密钥"`:                                                `error_invalid:"连接失败，请检查地址"`,
+		`error_unauthorized:"认证失败，管理密钥无效"`:                                             `error_unauthorized:"认证失败"`,
+		`remember_password_label:"記住密碼"`:                                               `remember_password_label:"記住連線"`,
+		`management_key_label:"管理金鑰:"`:                                                 `management_key_label:"管理存取:"`,
+		`management_key_placeholder:"請輸入管理金鑰"`:                                         `management_key_placeholder:"無需密碼"`,
+		`error_invalid:"連線失敗，請檢查位址和金鑰"`:                                                `error_invalid:"連線失敗，請檢查位址"`,
+		`error_unauthorized:"驗證失敗，管理金鑰無效"`:                                             `error_unauthorized:"驗證失敗"`,
+		`remember_password_label:"Запомнить пароль"`:                                   `remember_password_label:"Запомнить подключение"`,
+		`management_key_label:"Ключ управления:"`:                                      `management_key_label:"Доступ к управлению:"`,
+		`management_key_placeholder:"Введите ключ управления"`:                         `management_key_placeholder:"Пароль не требуется"`,
+		`error_unauthorized:"Ошибка аутентификации, недействительный ключ управления"`: `error_unauthorized:"Ошибка аутентификации"`,
+		`error_invalid:"Не удалось подключиться, проверьте адрес и ключ"`:              `error_invalid:"Не удалось подключиться, проверьте адрес"`,
+	}
+	for oldValue, newValue := range replacements {
+		patched = strings.ReplaceAll(patched, oldValue, newValue)
+	}
+
+	if patched == content {
+		return
+	}
+	if err = atomicWriteFile(localPath, []byte(patched)); err != nil {
+		log.WithError(err).Warn("failed to patch management control panel for keyless access")
+		return
+	}
+	log.Info("management control panel patched for keyless access")
 }
 
 func pinnedManagementAsset(localPath string) bool {
