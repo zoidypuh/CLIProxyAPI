@@ -28,6 +28,7 @@ const (
 	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
 	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
 	managementAssetName          = "management.html"
+	managementPinnedMarkerSuffix = ".pinned"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
@@ -190,6 +191,17 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return false
 	}
 	localPath := filepath.Join(staticDir, managementAssetName)
+	if pinnedManagementAsset(localPath) {
+		if _, err := os.Stat(localPath); err == nil {
+			log.Debug("management asset sync skipped: pinned local asset is present")
+			return true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.WithError(err).Warn("failed to stat pinned local management asset")
+			return false
+		}
+		log.Warn("management asset sync skipped: pin marker exists but local asset is missing")
+		return false
+	}
 
 	_, _, _ = sfGroup.Do(localPath, func() (interface{}, error) {
 		lastUpdateCheckMu.Lock()
@@ -278,6 +290,11 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	})
 
 	_, err := os.Stat(localPath)
+	return err == nil
+}
+
+func pinnedManagementAsset(localPath string) bool {
+	_, err := os.Stat(localPath + managementPinnedMarkerSuffix)
 	return err == nil
 }
 
