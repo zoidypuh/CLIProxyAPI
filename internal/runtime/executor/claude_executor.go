@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -45,25 +44,80 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
+const claudeCodeBetaHeader = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,fast-mode-2026-02-01"
+
 // oauthToolRenameMap maps OpenCode-style (lowercase) tool names to Claude Code-style
 // (TitleCase) names. Anthropic uses tool name fingerprinting to detect third-party
 // clients on OAuth traffic. Renaming to official names avoids extra-usage billing.
 // All tools are mapped to TitleCase equivalents to match Claude Code naming patterns.
 var oauthToolRenameMap = map[string]string{
-	"bash":         "Bash",
-	"read":         "Read",
-	"write":        "Write",
-	"edit":         "Edit",
-	"glob":         "Glob",
-	"grep":         "Grep",
-	"task":         "Task",
-	"webfetch":     "WebFetch",
-	"todowrite":    "TodoWrite",
-	"question":     "Question",
-	"skill":        "Skill",
-	"ls":           "LS",
-	"todoread":     "TodoRead",
-	"notebookedit": "NotebookEdit",
+	"agents_list":          "AgentList",
+	"bash":                 "Bash",
+	"bashoutput":           "BashOutput",
+	"browser":              "BrowserControl",
+	"canvas":               "CanvasView",
+	"clarify":              "Clarify",
+	"create_task":          "TaskCreate",
+	"cron":                 "Scheduler",
+	"cronjob":              "CronJob",
+	"delegate_task":        "DelegateTask",
+	"edit":                 "Edit",
+	"exec":                 "Bash",
+	"execute_code":         "ExecuteCode",
+	"exitplanmode":         "ExitPlanMode",
+	"gateway":              "SystemCtl",
+	"get_history":          "TaskHistory",
+	"glob":                 "Glob",
+	"grep":                 "Grep",
+	"hindsight_recall":     "HindsightRecall",
+	"hindsight_retain":     "HindsightRetain",
+	"image_generate":       "ImageCreate",
+	"killbash":             "KillBash",
+	"lcm_describe":         "ContextDescribe",
+	"lcm_expand":           "ContextExpand",
+	"lcm_expand_query":     "ContextQuery",
+	"lcm_grep":             "ContextGrep",
+	"list_tasks":           "TaskList",
+	"ls":                   "LS",
+	"memory_get":           "KnowledgeGet",
+	"memory_search":        "KnowledgeSearch",
+	"message":              "SendMessage",
+	"multiedit":            "MultiEdit",
+	"music_generate":       "MusicCreate",
+	"nodes":                "DeviceControl",
+	"notebookedit":         "NotebookEdit",
+	"notebookread":         "NotebookRead",
+	"patch":                "Patch",
+	"pdf":                  "PdfParse",
+	"process":              "BashSession",
+	"question":             "Question",
+	"read":                 "Read",
+	"read_file":            "FileRead",
+	"search_files":         "FileSearch",
+	"send_to_task":         "TaskSend",
+	"session_search":       "SessionSearch",
+	"session_status":       "StatusCheck",
+	"skill":                "Skill",
+	"skill_manage":         "SkillManage",
+	"skill_view":           "SkillView",
+	"task":                 "Task",
+	"task_store":           "TaskStore",
+	"task_yield_interrupt": "TaskYieldInterrupt",
+	"terminal":             "Terminal",
+	"text_to_speech":       "TextToSpeech",
+	"todoread":             "TodoRead",
+	"todowrite":            "TodoWrite",
+	"tts":                  "Speech",
+	"video_generate":       "VideoCreate",
+	"vision_analyze":       "VisionAnalyze",
+	"web_extract":          "WebExtract",
+	"web_fetch":            "WebFetch",
+	"web_search":           "WebSearch",
+	"webfetch":             "WebFetch",
+	"websearch":            "WebSearch",
+	"write":                "Write",
+	"write_file":           "FileWrite",
+	"yield_task":           "TaskYield",
 }
 
 // oauthToolRenameReverseMap is the inverse of oauthToolRenameMap for response decoding.
@@ -78,6 +132,42 @@ var oauthToolRenameReverseMap = func() map[string]string {
 // oauthToolsToRemove lists tool names that must be stripped from OAuth requests
 // even after remapping. Currently empty — all tools are mapped instead of removed.
 var oauthToolsToRemove = map[string]bool{}
+
+var claudeOAuthPropertyRenameMap = map[string]string{
+	"agent_id":        "worker_id",
+	"conversation_id": "thread_ref",
+	"session_id":      "thread_id",
+	"summary_id":      "chunk_id",
+	"summaryIds":      "chunk_ids",
+	"system_event":    "event_text",
+	"wake_at":         "trigger_at",
+	"wake_event":      "trigger_event",
+}
+
+var claudeCodeOAuthToolNames = map[string]bool{
+	"Bash":         true,
+	"BashOutput":   true,
+	"Edit":         true,
+	"ExitPlanMode": true,
+	"Glob":         true,
+	"Grep":         true,
+	"KillBash":     true,
+	"LS":           true,
+	"MultiEdit":    true,
+	"NotebookEdit": true,
+	"NotebookRead": true,
+	"Question":     true,
+	"Read":         true,
+	"Skill":        true,
+	"Task":         true,
+	"TodoRead":     true,
+	"TodoWrite":    true,
+	"WebFetch":     true,
+	"WebSearch":    true,
+	"Write":        true,
+}
+
+const claudeOAuthMCPServerName = "local"
 
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
@@ -96,9 +186,8 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	if isAnthropicBase && !isClaudeOAuthToken(apiKey) {
 		req.Header.Del("Authorization")
 		req.Header.Set("x-api-key", apiKey)
 	} else {
@@ -144,6 +233,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	oauthToken := isClaudeOAuthToken(apiKey)
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	originalPayloadSource := req.Payload
@@ -154,6 +244,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = restoreOriginalSystemMessages(body, originalPayload)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -168,6 +259,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body = ensureModelMaxTokens(body, baseModel)
+	if oauthToken && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+		body = applyClaudeCodeOAuthRequestDefaults(body)
+	}
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -193,16 +287,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
 	bodyForUpstream := body
-	oauthToken := isClaudeOAuthToken(apiKey)
 	oauthToolNamesRemapped := false
+	var oauthToolNameReverseMap map[string]string
 	if oauthToken && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
-	// Remap third-party tool names to Claude Code equivalents and remove
-	// tools without official counterparts. This prevents Anthropic from
-	// fingerprinting the request as third-party via tool naming patterns.
+	// Remap third-party tool names to Claude Code equivalents or MCP-style
+	// names to avoid third-party tool-name fingerprints.
 	if oauthToken {
-		bodyForUpstream, oauthToolNamesRemapped = remapOAuthToolNames(bodyForUpstream)
+		bodyForUpstream, oauthToolNamesRemapped, oauthToolNameReverseMap = remapOAuthToolNamesForOAuth(bodyForUpstream)
 	}
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
@@ -302,7 +395,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	// Reverse the OAuth tool name remap so the downstream client sees original names.
 	if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
-		data = reverseRemapOAuthToolNames(data)
+		data = reverseRemapOAuthToolNamesWithMap(data, oauthToolNameReverseMap)
 	}
 	data = applyClaudeCloakResponseReplacements(ctx, e.cfg, auth, data)
 	var param any
@@ -335,6 +428,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	oauthToken := isClaudeOAuthToken(apiKey)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -343,6 +437,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = restoreOriginalSystemMessages(body, originalPayload)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -357,6 +452,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body = ensureModelMaxTokens(body, baseModel)
+	if oauthToken && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+		body = applyClaudeCodeOAuthRequestDefaults(body)
+	}
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -379,16 +477,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
 	bodyForUpstream := body
-	oauthToken := isClaudeOAuthToken(apiKey)
 	oauthToolNamesRemapped := false
+	var oauthToolNameReverseMap map[string]string
 	if oauthToken && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
-	// Remap third-party tool names to Claude Code equivalents and remove
-	// tools without official counterparts. This prevents Anthropic from
-	// fingerprinting the request as third-party via tool naming patterns.
+	// Remap third-party tool names to Claude Code equivalents or MCP-style
+	// names to avoid third-party tool-name fingerprints.
 	if oauthToken {
-		bodyForUpstream, oauthToolNamesRemapped = remapOAuthToolNames(bodyForUpstream)
+		bodyForUpstream, oauthToolNamesRemapped, oauthToolNameReverseMap = remapOAuthToolNamesForOAuth(bodyForUpstream)
 	}
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
@@ -485,7 +582,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 				}
 				if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
-					line = reverseRemapOAuthToolNamesFromStreamLine(line)
+					line = reverseRemapOAuthToolNamesFromStreamLineWithMap(line, oauthToolNameReverseMap)
 				}
 				for _, rewrittenLine := range rewriter.RewriteLine(line) {
 					cloned := make([]byte, len(rewrittenLine)+1)
@@ -522,7 +619,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 			}
 			if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
-				line = reverseRemapOAuthToolNamesFromStreamLine(line)
+				line = reverseRemapOAuthToolNamesFromStreamLineWithMap(line, oauthToolNameReverseMap)
 			}
 			for _, rewrittenLine := range rewriter.RewriteLine(line) {
 				chunks := sdktranslator.TranslateStream(
@@ -578,6 +675,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = restoreOriginalSystemMessages(body, req.Payload)
 
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructionsWithSigningMode(
@@ -754,6 +852,24 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	return betas, body
 }
 
+func applyClaudeCodeOAuthRequestDefaults(body []byte) []byte {
+	thinkingResult := gjson.GetBytes(body, "thinking")
+	if !thinkingResult.Exists() {
+		body, _ = sjson.SetBytes(body, "thinking.type", "adaptive")
+		thinkingResult = gjson.GetBytes(body, "thinking")
+	}
+
+	if strings.EqualFold(strings.TrimSpace(thinkingResult.Get("type").String()), "adaptive") && !gjson.GetBytes(body, "output_config.effort").Exists() {
+		body, _ = sjson.SetBytes(body, "output_config.effort", "medium")
+	}
+
+	if !gjson.GetBytes(body, "context_management").Exists() {
+		body, _ = sjson.SetRawBytes(body, "context_management", []byte(`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`))
+	}
+
+	return body
+}
+
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
 // Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
 // See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
@@ -921,7 +1037,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config) {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
@@ -934,12 +1050,12 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		hd = cfg.ClaudeHeaderDefaults
 	}
 
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	if isAnthropicBase && !isClaudeOAuthToken(apiKey) {
 		r.Header.Del("Authorization")
 		r.Header.Set("x-api-key", apiKey)
 	} else {
+		r.Header.Del("x-api-key")
 		r.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	r.Header.Set("Content-Type", "application/json")
@@ -954,12 +1070,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	baseBetas := claudeCodeBetaHeader
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
 	}
 	if !strings.Contains(baseBetas, "interleaved-thinking") {
 		baseBetas += ",interleaved-thinking-2025-05-14"
@@ -987,40 +1100,23 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
+	r.Header.Set("Anthropic-Version", "2023-06-01")
 	// Only forward Anthropic-specific fingerprint headers to api.anthropic.com.
 	// Third-party upstreams (e.g. api.xheai.cc) reject these headers with 400 or hang.
 	if isAnthropicBase {
-		// Only set browser access header for API key mode; real Claude Code CLI does not send it.
-		if useAPIKey {
-			misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
-		}
-		misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
+		r.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
+		r.Header.Set("X-App", "cli")
 	}
-	// Values below match Claude Code 2.1.92 / @anthropic-ai/sdk 0.80.0 (updated 2026-04-04).
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
+	// Values below match Claude Code 2.1.119 / @anthropic-ai/sdk 0.81.0.
+	r.Header.Set("X-Stainless-Retry-Count", "0")
+	r.Header.Set("X-Stainless-Runtime", "node")
+	r.Header.Set("X-Stainless-Lang", "js")
+	r.Header.Set("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
-	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
-	if isAnthropicBase {
-		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
-	}
-	misc.EnsureHeader(r.Header, ginHeaders, "Accept-Language", "*")
-	misc.EnsureHeader(r.Header, ginHeaders, "Sec-Fetch-Mode", "cors")
 	r.Header.Set("Connection", "keep-alive")
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-		// SSE streams must not be compressed: the downstream scanner reads
-		// line-delimited text and cannot parse compressed bytes.  Using
-		// "identity" tells the upstream to send an uncompressed stream.
-		r.Header.Set("Accept-Encoding", "identity")
-	} else {
-		r.Header.Set("Accept", "application/json")
-		r.Header.Set("Accept-Encoding", "br, gzip, deflate")
-	}
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	// Legacy mode keeps OS/Arch runtime-derived; stabilized mode pins OS/Arch
 	// to the configured baseline while still allowing newer official
 	// User-Agent/package/runtime tuples to upgrade the software fingerprint.
@@ -1034,12 +1130,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
-	// may override it with a user-configured value.  Compressed SSE breaks the line
-	// scanner regardless of user preference, so this is non-negotiable for streams.
-	if stream {
-		r.Header.Set("Accept-Encoding", "identity")
-	}
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1067,14 +1159,26 @@ func isClaudeOAuthToken(apiKey string) bool {
 }
 
 // remapOAuthToolNames renames third-party tool names to Claude Code equivalents
-// and removes tools without an official counterpart. This prevents Anthropic from
+// and wraps non-Claude-Code tools in MCP-style names. This prevents Anthropic from
 // fingerprinting the request as a third-party client via tool naming patterns.
 //
 // It operates on: tools[].name, tool_choice.name, and all tool_use/tool_reference
-// references in messages. Removed tools' corresponding tool_result blocks are preserved
-// (they just become orphaned, which is safe for Claude).
+// references in messages.
 func remapOAuthToolNames(body []byte) ([]byte, bool) {
+	body, renamed, _ := remapOAuthToolNamesForOAuth(body)
+	return body, renamed
+}
+
+func remapOAuthToolNamesForOAuth(body []byte) ([]byte, bool, map[string]string) {
 	renamed := false
+	reverseMap := make(map[string]string)
+	recordRename := func(originalName, upstreamName string) {
+		if originalName == "" || upstreamName == "" || upstreamName == originalName {
+			return
+		}
+		reverseMap[upstreamName] = originalName
+		renamed = true
+	}
 	// 1. Rewrite tools array in a single pass (if present).
 	// IMPORTANT: do not mutate names first and then rebuild from an older gjson
 	// snapshot. gjson results are snapshots of the original bytes; rebuilding from a
@@ -1098,18 +1202,15 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 			}
 
 			name := tool.Get("name").String()
-			if oauthToolsToRemove[name] {
-				return true
-			}
-
 			toolJSON := tool.Raw
-			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+			if newName := oauthUpstreamToolName(name); newName != "" && newName != name {
 				updatedTool, err := sjson.Set(toolJSON, "name", newName)
 				if err == nil {
 					toolJSON = updatedTool
-					renamed = true
+					recordRename(name, newName)
 				}
 			}
+			toolJSON = stripClaudeOAuthToolDescriptionText(toolJSON)
 
 			if toolCount > 0 {
 				toolsJSON.WriteByte(',')
@@ -1119,20 +1220,20 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 			return true
 		})
 		toolsJSON.WriteByte(']')
-		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+		if toolCount == 0 {
+			body, _ = sjson.DeleteBytes(body, "tools")
+		} else {
+			body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+		}
 	}
 
 	// 2. Rename tool_choice if it references a known tool
 	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
 	if toolChoiceType == "tool" {
 		tcName := gjson.GetBytes(body, "tool_choice.name").String()
-		if oauthToolsToRemove[tcName] {
-			// The chosen tool was removed from the tools array, so drop tool_choice to
-			// keep the payload internally consistent and fall back to normal auto tool use.
-			body, _ = sjson.DeleteBytes(body, "tool_choice")
-		} else if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
+		if newName := oauthUpstreamToolName(tcName); newName != "" && newName != tcName {
 			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
-			renamed = true
+			recordRename(tcName, newName)
 		}
 	}
 
@@ -1149,17 +1250,17 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 				switch partType {
 				case "tool_use":
 					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+					if newName := oauthUpstreamToolName(name); newName != "" && newName != name {
 						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
-						renamed = true
+						recordRename(name, newName)
 					}
 				case "tool_reference":
 					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+					if newName := oauthUpstreamToolName(toolName); newName != "" && newName != toolName {
 						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
-						renamed = true
+						recordRename(toolName, newName)
 					}
 				case "tool_result":
 					// Handle nested tool_reference blocks inside tool_result.content[]
@@ -1170,10 +1271,10 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
 							if nestedPart.Get("type").String() == "tool_reference" {
 								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+								if newName := oauthUpstreamToolName(nestedToolName); newName != "" && newName != nestedToolName {
 									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
 									body, _ = sjson.SetBytes(body, nestedPath, newName)
-									renamed = true
+									recordRename(nestedToolName, newName)
 								}
 							}
 							return true
@@ -1186,13 +1287,182 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 		})
 	}
 
-	return body, renamed
+	return body, renamed, reverseMap
+}
+
+func oauthUpstreamToolName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if oauthToolsToRemove[name] {
+		return ""
+	}
+	if claudeCodeOAuthToolNames[name] {
+		return name
+	}
+	if newName, ok := oauthToolRenameMap[name]; ok {
+		return newName
+	}
+	if isClaudeCodeMCPToolName(name) {
+		return name
+	}
+	if strings.HasPrefix(name, "mcp_") {
+		name = strings.TrimPrefix(name, "mcp_")
+	}
+	if isLowerSnakeToolName(name) {
+		return snakeToolNameToPascal(name)
+	}
+	return claudeCodeMCPToolName(claudeOAuthMCPServerName, name)
+}
+
+func isClaudeCodeMCPToolName(name string) bool {
+	if !strings.HasPrefix(name, "mcp__") {
+		return false
+	}
+	parts := strings.Split(name, "__")
+	return len(parts) >= 3 && parts[1] != "" && parts[2] != ""
+}
+
+func claudeCodeMCPToolName(serverName, toolName string) string {
+	serverName = sanitizeClaudeToolNamePart(serverName)
+	toolName = sanitizeClaudeToolNamePart(toolName)
+	if serverName == "" {
+		serverName = claudeOAuthMCPServerName
+	}
+	if toolName == "" {
+		toolName = "tool"
+	}
+	return "mcp__" + serverName + "__" + toolName
+}
+
+func sanitizeClaudeToolNamePart(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_-")
+}
+
+func isLowerSnakeToolName(name string) bool {
+	if name == "" {
+		return false
+	}
+	hasLetter := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasLetter = true
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
+func snakeToolNameToPascal(name string) string {
+	parts := strings.Split(name, "_")
+	var b strings.Builder
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		b.WriteString(strings.ToUpper(part[:1]))
+		if len(part) > 1 {
+			b.WriteString(part[1:])
+		}
+	}
+	if b.Len() == 0 {
+		return claudeCodeMCPToolName(claudeOAuthMCPServerName, name)
+	}
+	return b.String()
+}
+
+func stripClaudeOAuthToolDescriptionText(toolJSON string) string {
+	var tool any
+	if err := json.Unmarshal([]byte(toolJSON), &tool); err != nil {
+		return toolJSON
+	}
+	stripDescriptionText(tool)
+	renameClaudeOAuthPropertyNames(tool)
+	out, err := json.Marshal(tool)
+	if err != nil {
+		return toolJSON
+	}
+	return string(out)
+}
+
+func stripDescriptionText(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if key == "description" {
+				v[key] = ""
+				continue
+			}
+			stripDescriptionText(child)
+		}
+	case []any:
+		for _, child := range v {
+			stripDescriptionText(child)
+		}
+	}
+}
+
+func renameClaudeOAuthPropertyNames(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if renamed, ok := claudeOAuthPropertyRenameMap[key]; ok {
+				delete(v, key)
+				v[renamed] = child
+				key = renamed
+			}
+			if childString, ok := child.(string); ok {
+				if renamed, ok := claudeOAuthPropertyRenameMap[childString]; ok {
+					v[key] = renamed
+				}
+				continue
+			}
+			renameClaudeOAuthPropertyNames(child)
+		}
+	case []any:
+		for i, child := range v {
+			if childString, ok := child.(string); ok {
+				if renamed, ok := claudeOAuthPropertyRenameMap[childString]; ok {
+					v[i] = renamed
+				}
+				continue
+			}
+			renameClaudeOAuthPropertyNames(child)
+		}
+	}
 }
 
 // reverseRemapOAuthToolNames reverses the tool name mapping for non-stream responses.
 // It maps Claude Code TitleCase names back to the original lowercase names so the
 // downstream client receives tool names it recognizes.
 func reverseRemapOAuthToolNames(body []byte) []byte {
+	return reverseRemapOAuthToolNamesWithMap(body, oauthToolRenameReverseMap)
+}
+
+func reverseRemapOAuthToolNamesWithMap(body []byte, reverseMap map[string]string) []byte {
+	if len(reverseMap) == 0 {
+		return body
+	}
 	content := gjson.GetBytes(body, "content")
 	if !content.Exists() || !content.IsArray() {
 		return body
@@ -1202,15 +1472,29 @@ func reverseRemapOAuthToolNames(body []byte) []byte {
 		switch partType {
 		case "tool_use":
 			name := part.Get("name").String()
-			if origName, ok := oauthToolRenameReverseMap[name]; ok {
+			if origName, ok := reverseMap[name]; ok {
 				path := fmt.Sprintf("content.%d.name", index.Int())
 				body, _ = sjson.SetBytes(body, path, origName)
 			}
 		case "tool_reference":
 			toolName := part.Get("tool_name").String()
-			if origName, ok := oauthToolRenameReverseMap[toolName]; ok {
+			if origName, ok := reverseMap[toolName]; ok {
 				path := fmt.Sprintf("content.%d.tool_name", index.Int())
 				body, _ = sjson.SetBytes(body, path, origName)
+			}
+		case "tool_result":
+			nestedContent := part.Get("content")
+			if nestedContent.Exists() && nestedContent.IsArray() {
+				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
+					if nestedPart.Get("type").String() == "tool_reference" {
+						nestedToolName := nestedPart.Get("tool_name").String()
+						if origName, ok := reverseMap[nestedToolName]; ok {
+							nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
+							body, _ = sjson.SetBytes(body, nestedPath, origName)
+						}
+					}
+					return true
+				})
 			}
 		}
 		return true
@@ -1220,6 +1504,13 @@ func reverseRemapOAuthToolNames(body []byte) []byte {
 
 // reverseRemapOAuthToolNamesFromStreamLine reverses the tool name mapping for SSE stream lines.
 func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
+	return reverseRemapOAuthToolNamesFromStreamLineWithMap(line, oauthToolRenameReverseMap)
+}
+
+func reverseRemapOAuthToolNamesFromStreamLineWithMap(line []byte, reverseMap map[string]string) []byte {
+	if len(reverseMap) == 0 {
+		return line
+	}
 	payload := helps.JSONPayload(line)
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return line
@@ -1237,7 +1528,7 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
 	switch blockType {
 	case "tool_use":
 		name := contentBlock.Get("name").String()
-		if origName, ok := oauthToolRenameReverseMap[name]; ok {
+		if origName, ok := reverseMap[name]; ok {
 			updated, err = sjson.SetBytes(payload, "content_block.name", origName)
 			if err != nil {
 				return line
@@ -1247,7 +1538,7 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
 		}
 	case "tool_reference":
 		toolName := contentBlock.Get("tool_name").String()
-		if origName, ok := oauthToolRenameReverseMap[toolName]; ok {
+		if origName, ok := reverseMap[toolName]; ok {
 			updated, err = sjson.SetBytes(payload, "content_block.tool_name", origName)
 			if err != nil {
 				return line
@@ -1610,9 +1901,9 @@ func buildClaudeTextSystemBlock(text string) string {
 	return string(block)
 }
 
-func buildClaudeTextSystemBlockWithCache(text, scope string) string {
+func buildClaudeTextSystemBlockWithCache(text string) string {
 	quoted, _ := json.Marshal(text)
-	return fmt.Sprintf(`{"type":"text","text":%s,"cache_control":{"type":"ephemeral","scope":"%s"}}`, quoted, scope)
+	return fmt.Sprintf(`{"type":"text","text":%s,"cache_control":{"type":"ephemeral"}}`, quoted)
 }
 
 // generateBillingHeader creates the x-anthropic-billing-header text block that
@@ -1640,6 +1931,100 @@ func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version,
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool, cfg *config.Config) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, helps.DefaultClaudeVersion(cfg), "", "")
+}
+
+func restoreOriginalSystemMessages(body []byte, original []byte) []byte {
+	if len(original) == 0 {
+		return body
+	}
+	systemTexts := extractOriginalSystemTexts(original)
+	if len(systemTexts) == 0 {
+		return body
+	}
+
+	system := gjson.GetBytes(body, "system")
+	if !system.Exists() || system.Raw == "null" {
+		if len(systemTexts) == 1 {
+			body, _ = sjson.SetBytes(body, "system", systemTexts[0])
+			return body
+		}
+		var blocks []map[string]string
+		for _, text := range systemTexts {
+			blocks = append(blocks, map[string]string{"type": "text", "text": text})
+		}
+		body, _ = sjson.SetBytes(body, "system", blocks)
+		return body
+	}
+
+	if system.Type == gjson.String {
+		combined := append([]string{strings.TrimSpace(system.String())}, systemTexts...)
+		body, _ = sjson.SetBytes(body, "system", strings.Join(nonEmptyStrings(combined), "\n\n"))
+		return body
+	}
+
+	if system.IsArray() {
+		nextIndex := len(system.Array())
+		for _, text := range systemTexts {
+			body, _ = sjson.SetBytes(body, fmt.Sprintf("system.%d", nextIndex), map[string]string{
+				"type": "text",
+				"text": text,
+			})
+			nextIndex++
+		}
+	}
+	return body
+}
+
+func extractOriginalSystemTexts(original []byte) []string {
+	var texts []string
+	messages := gjson.GetBytes(original, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+			if role != "system" && role != "developer" {
+				return true
+			}
+			texts = append(texts, extractMessageContentText(msg.Get("content"))...)
+			return true
+		})
+	}
+	if system := gjson.GetBytes(original, "system"); system.Exists() {
+		texts = append(texts, extractMessageContentText(system)...)
+	}
+	return nonEmptyStrings(texts)
+}
+
+func extractMessageContentText(content gjson.Result) []string {
+	if content.Type == gjson.String {
+		return []string{strings.TrimSpace(content.String())}
+	}
+	if !content.IsArray() {
+		return nil
+	}
+	var texts []string
+	content.ForEach(func(_, part gjson.Result) bool {
+		partType := part.Get("type").String()
+		switch partType {
+		case "", "text", "input_text":
+			text := strings.TrimSpace(part.Get("text").String())
+			if text != "" {
+				texts = append(texts, text)
+			}
+		}
+		return true
+	})
+	return texts
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
@@ -1677,43 +2062,50 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
 	billingBlock := buildClaudeTextSystemBlock(billingText)
 
-	agentBlock := buildClaudeTextSystemBlockWithCache("You are Claude Code, Anthropic's official CLI for Claude.", "org")
-	introBlock := buildClaudeTextSystemBlockWithCache(helps.ClaudeCodeIntro, "global")
-	systemBlock := buildClaudeTextSystemBlock(helps.ClaudeCodeSystem)
-	doingTasksBlock := buildClaudeTextSystemBlock(strings.Join([]string{
+	agentBlock := buildClaudeTextSystemBlockWithCache("You are Claude Code, Anthropic's official CLI for Claude.")
+	combinedSystem := strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
 		helps.ClaudeCodeDoingTasks,
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n"))
+	}, "\n\n")
+	systemBlock := buildClaudeTextSystemBlockWithCache(combinedSystem)
 
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + introBlock + "," + systemBlock + "," + doingTasksBlock + "]"
+	var userSystemParts []string
+	preserveForwardedSystem := !strictMode || oauthMode
+	if preserveForwardedSystem && system.IsArray() {
+		system.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "text" {
+				txt := strings.TrimSpace(part.Get("text").String())
+				if txt != "" {
+					userSystemParts = append(userSystemParts, txt)
+				}
+			}
+			return true
+		})
+	} else if preserveForwardedSystem && system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
+		userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
+	}
+
+	systemBlocks := []string{billingBlock, agentBlock, systemBlock}
+	if len(userSystemParts) > 0 {
+		forwardedSystem := strings.Join(userSystemParts, "\n\n")
+		if oauthMode {
+			forwardedSystem = sanitizeForwardedSystemPrompt(forwardedSystem)
+		}
+		if strings.TrimSpace(forwardedSystem) != "" && oauthMode {
+			systemBlocks = append(systemBlocks, buildClaudeTextSystemBlock(forwardedSystem))
+		}
+	}
+
+	systemResult := "[" + strings.Join(systemBlocks, ",") + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
-	// Collect user system instructions and prepend to first user message
-	if !strictMode {
-		var userSystemParts []string
-		if system.IsArray() {
-			system.ForEach(func(_, part gjson.Result) bool {
-				if part.Get("type").String() == "text" {
-					txt := strings.TrimSpace(part.Get("text").String())
-					if txt != "" {
-						userSystemParts = append(userSystemParts, txt)
-					}
-				}
-				return true
-			})
-		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
-			userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
-		}
-
-		if len(userSystemParts) > 0 {
-			combined := strings.Join(userSystemParts, "\n\n")
-			if oauthMode {
-				combined = sanitizeForwardedSystemPrompt(combined)
-			}
-			if strings.TrimSpace(combined) != "" {
-				payload = prependToFirstUserMessage(payload, combined)
-			}
+	if len(userSystemParts) > 0 && !oauthMode {
+		forwardedSystem := strings.Join(userSystemParts, "\n\n")
+		if strings.TrimSpace(forwardedSystem) != "" {
+			payload = prependToFirstUserMessage(payload, forwardedSystem)
 		}
 	}
 
@@ -1725,12 +2117,40 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 // the minimum tool/task guidance while removing virtually all client-specific
 // prompt structure that Anthropic may classify as third-party agent traffic.
 func sanitizeForwardedSystemPrompt(text string) string {
-	if strings.TrimSpace(text) == "" {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
 		return ""
+	}
+	if !looksLikeLargeAgentSystemTemplate(trimmed) {
+		return trimmed
 	}
 	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
 Keep responses concise and focused on the user's request.
 Prefer acting on the user's task over describing product-specific workflows.`)
+}
+
+func looksLikeLargeAgentSystemTemplate(text string) bool {
+	if len(text) >= 12000 {
+		return true
+	}
+	markers := 0
+	for _, marker := range []string{
+		"## Tooling",
+		"## Workspace",
+		"## Messaging",
+		"## Available tools",
+		"<available_skills>",
+		"Tool-use protocol:",
+		"Available simulated tools:",
+		"lossless context",
+		"HEARTBEAT",
+		"sessions_",
+	} {
+		if strings.Contains(text, marker) {
+			markers++
+		}
+	}
+	return markers >= 3
 }
 
 // buildTextBlock constructs a JSON text block object with proper escaping.

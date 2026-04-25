@@ -164,6 +164,95 @@ func TestApplyClaudeHeaders_UsesConfiguredUserAgent(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_MatchesCapturedClaudeCliHeaders(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-captured-headers",
+		Metadata: map[string]any{"access_token": "sk-ant-oat01-test"},
+	}
+
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent":                  []string{"OpenAI/Python 2.32.0"},
+		"X-Stainless-Lang":            []string{"python"},
+		"X-Stainless-Runtime":         []string{"CPython"},
+		"X-Stainless-Retry-Count":     []string{"4"},
+		"X-Stainless-Runtime-Version": []string{"3.11.14"},
+	})
+	applyClaudeHeaders(req, auth, "sk-ant-oat01-test", true, nil, cfg)
+
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat01-test" {
+		t.Fatalf("Authorization = %q, want OAuth bearer token", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want empty for OAuth token", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.119 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want captured Claude CLI UA", got)
+	}
+	if got := req.Header.Get("X-Stainless-Package-Version"); got != "0.81.0" {
+		t.Fatalf("X-Stainless-Package-Version = %q, want %q", got, "0.81.0")
+	}
+	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != "v24.3.0" {
+		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, "v24.3.0")
+	}
+	if got := req.Header.Get("X-Stainless-Os"); got != "Linux" {
+		t.Fatalf("X-Stainless-Os = %q, want %q", got, "Linux")
+	}
+	if got := req.Header.Get("X-Stainless-Arch"); got != "x64" {
+		t.Fatalf("X-Stainless-Arch = %q, want %q", got, "x64")
+	}
+	if got := req.Header.Get("X-Stainless-Lang"); got != "js" {
+		t.Fatalf("X-Stainless-Lang = %q, want %q", got, "js")
+	}
+	if got := req.Header.Get("X-Stainless-Runtime"); got != "node" {
+		t.Fatalf("X-Stainless-Runtime = %q, want %q", got, "node")
+	}
+	if got := req.Header.Get("X-Stainless-Retry-Count"); got != "0" {
+		t.Fatalf("X-Stainless-Retry-Count = %q, want %q", got, "0")
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != claudeCodeBetaHeader {
+		t.Fatalf("Anthropic-Beta = %q, want %q", got, claudeCodeBetaHeader)
+	}
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Fatalf("Accept = %q, want %q", got, "application/json")
+	}
+	if got := req.Header.Get("Accept-Encoding"); got != "gzip, deflate, br, zstd" {
+		t.Fatalf("Accept-Encoding = %q, want captured Claude CLI value", got)
+	}
+	for _, name := range []string{"x-client-request-id", "Accept-Language", "Sec-Fetch-Mode"} {
+		if got := req.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want empty", name, got)
+		}
+	}
+}
+
+func TestClaudeExecutorPrepareRequest_AnthropicOAuthUsesBearer(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Metadata: map[string]any{"access_token": "sk-ant-oat01-test"},
+	}
+
+	if err := NewClaudeExecutor(nil).PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest error: %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat01-test" {
+		t.Fatalf("Authorization = %q, want OAuth bearer token", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want empty for OAuth token", got)
+	}
+}
+
 func TestResolveOutboundClaudeEntrypoint_UsesResolvedDefaultUserAgent(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -183,8 +272,8 @@ func TestResolveOutboundClaudeEntrypoint_UsesResolvedDefaultUserAgent(t *testing
 		"User-Agent": []string{"curl/8.7.1"},
 	})
 
-	if got := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, "key-entrypoint-default"); got != "sdk-cli" {
-		t.Fatalf("resolveOutboundClaudeEntrypoint() = %q, want %q", got, "sdk-cli")
+	if got := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, "key-entrypoint-default"); got != "cli" {
+		t.Fatalf("resolveOutboundClaudeEntrypoint() = %q, want %q", got, "cli")
 	}
 }
 
@@ -312,8 +401,8 @@ func TestClaudeExecutor_CountTokens_BillingEntrypointMatchesResolvedUserAgent(t 
 	}
 
 	billingHeader := gjson.GetBytes(seenBody, "system.0.text").String()
-	if !strings.Contains(billingHeader, "cc_entrypoint=sdk-cli;") {
-		t.Fatalf("billing header = %q, want cc_entrypoint=sdk-cli", billingHeader)
+	if !strings.Contains(billingHeader, "cc_entrypoint=cli;") {
+		t.Fatalf("billing header = %q, want cc_entrypoint=cli", billingHeader)
 	}
 }
 
@@ -1562,10 +1651,9 @@ func TestEnsureModelMaxTokens_SkipsUnregisteredModel(t *testing.T) {
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding verifies that streaming
-// requests use Accept-Encoding: identity so the upstream cannot respond with a
-// compressed SSE body that would silently break the line scanner.
-func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
+// TestClaudeExecutor_ExecuteStream_SetsClaudeCliAcceptHeaders verifies that streaming
+// requests use the same Accept headers as current Claude Code.
+func TestClaudeExecutor_ExecuteStream_SetsClaudeCliAcceptHeaders(t *testing.T) {
 	var gotEncoding, gotAccept string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -1597,11 +1685,11 @@ func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
 		}
 	}
 
-	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "identity")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
-	if gotAccept != "text/event-stream" {
-		t.Errorf("Accept = %q, want %q", gotAccept, "text/event-stream")
+	if gotAccept != "application/json" {
+		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
 	}
 }
 
@@ -1635,8 +1723,8 @@ func TestClaudeExecutor_Execute_SetsCompressedAcceptEncoding(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if gotEncoding != "br, gzip, deflate" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "br, gzip, deflate")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
 	if gotAccept != "application/json" {
 		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
@@ -1902,9 +1990,9 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity verifies that the
-// streaming executor enforces Accept-Encoding: identity regardless of auth.Attributes override.
-func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity(t *testing.T) {
+// TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassClaudeCliDefault verifies that
+// the streaming executor keeps the current Claude Code Accept-Encoding regardless of auth.Attributes override.
+func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassClaudeCliDefault(t *testing.T) {
 	var gotEncoding string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -1917,7 +2005,7 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":                "key-123",
 		"base_url":               server.URL,
-		"header:Accept-Encoding": "gzip, deflate, br, zstd",
+		"header:Accept-Encoding": "identity",
 	}}
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -1936,13 +2024,15 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 		}
 	}
 
-	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q; stream path must enforce identity regardless of auth.Attributes override", gotEncoding)
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q; stream path must enforce current Claude Code default regardless of auth.Attributes override", gotEncoding)
 	}
 }
 
-func expectedClaudeCodeDoingTasksPrompt() string {
+func expectedClaudeCodeCombinedPrompt() string {
 	return strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
 		helps.ClaudeCodeDoingTasks,
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
@@ -1988,8 +2078,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	}
 
 	blocks := system.Array()
-	if len(blocks) != 5 {
-		t.Fatalf("expected 5 system blocks (billing+agent+intro+system+doingTasks), got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks (billing+agent+combined prompt), got %d", len(blocks))
 	}
 
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
@@ -1998,23 +2088,14 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
-	if blocks[1].Get("cache_control.scope").String() != "org" {
-		t.Fatalf("blocks[1] should have cache_control.scope=org, got %q", blocks[1].Get("cache_control.scope").String())
+	if blocks[1].Get("cache_control.type").String() != "ephemeral" {
+		t.Fatalf("blocks[1] should have ephemeral cache_control, got %s", blocks[1].Get("cache_control").Raw)
 	}
 	if !blocks[2].Get("cache_control").Exists() {
 		t.Fatalf("blocks[2] should have cache_control, got %s", blocks[2].Get("cache_control").Raw)
 	}
-	if blocks[2].Get("text").String() != helps.ClaudeCodeIntro {
-		t.Fatalf("blocks[2] should be intro block, got %q", blocks[2].Get("text").String())
-	}
-	if blocks[2].Get("cache_control.scope").String() != "global" {
-		t.Fatalf("blocks[2] should have cache_control.scope=global, got %q", blocks[2].Get("cache_control.scope").String())
-	}
-	if blocks[3].Get("text").String() != helps.ClaudeCodeSystem {
-		t.Fatalf("blocks[3] should be system block, got %q", blocks[3].Get("text").String())
-	}
-	if blocks[4].Get("text").String() != expectedClaudeCodeDoingTasksPrompt() {
-		t.Fatalf("blocks[4] should be doing tasks block, got %q", blocks[4].Get("text").String())
+	if blocks[2].Get("text").String() != expectedClaudeCodeCombinedPrompt() {
+		t.Fatalf("blocks[2] should be combined Claude Code prompt, got %q", blocks[2].Get("text").String())
 	}
 	assertPrependedReminderBlock(t, out, "You are a helpful assistant.", "hi")
 }
@@ -2026,8 +2107,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, true, nil)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 5 {
-		t.Fatalf("strict mode should produce 5 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("strict mode should produce 3 system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("strict mode should not forward system prompt into messages, got %q", got)
@@ -2041,8 +2122,8 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 	out := checkSystemInstructionsWithMode(payload, false, nil)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 5 {
-		t.Fatalf("empty string system should produce 5 blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("empty string system should produce 3 blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("empty string system should not alter messages, got %q", got)
@@ -2056,8 +2137,8 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false, nil)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 5 {
-		t.Fatalf("expected 5 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
 	assertPrependedReminderBlock(t, out, "Be concise.", "hi")
 }
@@ -2069,8 +2150,8 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false, nil)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 5 {
-		t.Fatalf("expected 5 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
 	assertPrependedReminderBlock(t, out, `Use <xml> tags & "quotes" in output.`, "hi")
 }
@@ -2106,8 +2187,8 @@ func TestCheckSystemInstructionsWithMode_EscapesConfiguredClaudeVersion(t *testi
 		t.Fatalf("payload should remain valid JSON: %s", string(out))
 	}
 	system := gjson.GetBytes(out, "system").Array()
-	if len(system) != 5 {
-		t.Fatalf("expected 5 system blocks, got %d", len(system))
+	if len(system) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(system))
 	}
 	billingHeader := system[0].Get("text").String()
 	if !strings.Contains(billingHeader, "cc_version="+configuredVersion+".") {
@@ -2116,16 +2197,71 @@ func TestCheckSystemInstructionsWithMode_EscapesConfiguredClaudeVersion(t *testi
 	if got := system[1].Get("text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("system[1] should remain the agent block, got %q", got)
 	}
-	if got := system[2].Get("text").String(); got != helps.ClaudeCodeIntro {
-		t.Fatalf("system[2] should remain the intro block, got %q", got)
-	}
-	if got := system[3].Get("text").String(); got != helps.ClaudeCodeSystem {
-		t.Fatalf("system[3] should remain the system block, got %q", got)
-	}
-	if got := system[4].Get("text").String(); got != expectedClaudeCodeDoingTasksPrompt() {
-		t.Fatalf("system[4] should remain the doing tasks block, got %q", got)
+	if got := system[2].Get("text").String(); got != expectedClaudeCodeCombinedPrompt() {
+		t.Fatalf("system[2] should remain the combined Claude Code prompt, got %q", got)
 	}
 	assertPrependedReminderBlock(t, out, "You are a helpful assistant.", "hi")
+}
+
+func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesShortSystemAsSystemBlock(t *testing.T) {
+	payload := []byte(`{"system":"# Mara\nIf asked for the proxy marker, reply exactly: MARA_PROXY_MARKER_9f7b2c","messages":[{"role":"user","content":"proxy marker?"}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, false, true, true, "2.1.119", "cli", "")
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 4 {
+		t.Fatalf("OAuth mode should preserve short system as fourth block, got %d blocks: %s", len(blocks), string(out))
+	}
+	if got := blocks[3].Get("text").String(); !strings.Contains(got, "MARA_PROXY_MARKER_9f7b2c") {
+		t.Fatalf("system[3] should preserve forwarded persona/system text, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "proxy marker?" {
+		t.Fatalf("OAuth mode should not move system text into user message, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithSigningMode_OAuthStrictStillPreservesShortSystem(t *testing.T) {
+	payload := []byte(`{"system":"# Sisyphus\nIf asked who you are, answer as Sisyphus.","messages":[{"role":"user","content":"who are you?"}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, true, true, true, "2.1.119", "cli", "")
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 4 {
+		t.Fatalf("OAuth strict mode should preserve short system as fourth block, got %d blocks: %s", len(blocks), string(out))
+	}
+	if got := blocks[3].Get("text").String(); !strings.Contains(got, "Sisyphus") {
+		t.Fatalf("system[3] should preserve forwarded short system text, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "who are you?" {
+		t.Fatalf("OAuth strict mode should not move system text into user message, got %q", got)
+	}
+}
+
+func TestRestoreOriginalSystemMessages_RestoresOpenAISystemRoleForClaudeCloak(t *testing.T) {
+	translated := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[{"type":"text","text":"proxy marker?"}]}]}`)
+	original := []byte(`{"messages":[{"role":"system","content":"# Mara\nIf asked for the proxy marker, reply exactly: MARA_PROXY_MARKER_9f7b2c"},{"role":"user","content":"proxy marker?"}]}`)
+
+	restored := restoreOriginalSystemMessages(translated, original)
+	out := checkSystemInstructionsWithSigningMode(restored, false, true, true, "2.1.119", "cli", "")
+
+	if got := gjson.GetBytes(out, "system.3.text").String(); !strings.Contains(got, "MARA_PROXY_MARKER_9f7b2c") {
+		t.Fatalf("system[3] should include restored OpenAI system role, got %q; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "proxy marker?" {
+		t.Fatalf("user message should stay intact, got %q", got)
+	}
+}
+
+func TestSanitizeForwardedSystemPrompt_OnlyParaphrasesLargeTemplates(t *testing.T) {
+	short := "# Mara\nIf asked for the proxy marker, reply exactly: MARA_PROXY_MARKER_9f7b2c"
+	if got := sanitizeForwardedSystemPrompt(short); got != short {
+		t.Fatalf("short persona system should be preserved, got %q", got)
+	}
+
+	largeTemplate := strings.Repeat("x", 12000)
+	if got := sanitizeForwardedSystemPrompt(largeTemplate); got == largeTemplate || !strings.Contains(got, "Use the available tools") {
+		t.Fatalf("large template should be paraphrased, got %q", got)
+	}
 }
 
 func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader(t *testing.T) {
@@ -2232,14 +2368,50 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	out := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 5 {
-		t.Fatalf("expected 5 injected system blocks (billing+agent+intro+system+doingTasks), got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 injected system blocks (billing+agent+combined prompt), got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
 		t.Fatalf("strict mode should not prepend a forwarded system reminder block, got %d content blocks", got)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(got, "\u200B") {
 		t.Fatalf("expected configured sensitive word obfuscation to apply, got %q", got)
+	}
+}
+
+func TestApplyClaudeCodeOAuthRequestDefaults_AddsCapturedClaudeCodeFields(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	out := applyClaudeCodeOAuthRequestDefaults(payload)
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want %q", got, "adaptive")
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "medium" {
+		t.Fatalf("output_config.effort = %q, want %q", got, "medium")
+	}
+	if got := gjson.GetBytes(out, "context_management.edits.0.type").String(); got != "clear_thinking_20251015" {
+		t.Fatalf("context_management.edits.0.type = %q, want clear_thinking_20251015", got)
+	}
+	if got := gjson.GetBytes(out, "context_management.edits.0.keep").String(); got != "all" {
+		t.Fatalf("context_management.edits.0.keep = %q, want all", got)
+	}
+}
+
+func TestApplyClaudeCodeOAuthRequestDefaults_PreservesManualThinking(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"enabled","budget_tokens":2048},"output_config":{"effort":"max"},"context_management":{"edits":[{"type":"custom"}]}}`)
+	out := applyClaudeCodeOAuthRequestDefaults(payload)
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled", got)
+	}
+	if got := gjson.GetBytes(out, "thinking.budget_tokens").Int(); got != 2048 {
+		t.Fatalf("thinking.budget_tokens = %d, want 2048", got)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+		t.Fatalf("output_config.effort = %q, want max", got)
+	}
+	if got := gjson.GetBytes(out, "context_management.edits.0.type").String(); got != "custom" {
+		t.Fatalf("context_management.edits.0.type = %q, want custom", got)
 	}
 }
 
@@ -2283,6 +2455,18 @@ func TestNormalizeClaudeTemperatureForThinking_AfterForcedToolChoiceKeepsOrigina
 	}
 }
 
+func TestDisableThinkingIfToolChoiceForced_ToolsWithoutForcedChoiceKeepThinking(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"},"tools":[{"name":"browser_navigate","input_schema":{"type":"object"}}]}`)
+	out := disableThinkingIfToolChoiceForced(payload)
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive", got)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "medium" {
+		t.Fatalf("output_config.effort = %q, want medium", got)
+	}
+}
+
 func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"Bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -2307,7 +2491,7 @@ func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	out, renamed := remapOAuthToolNames(body)
+	out, renamed, reverseMap := remapOAuthToolNamesForOAuth(body)
 	if !renamed {
 		t.Fatalf("renamed = false, want true")
 	}
@@ -2318,10 +2502,111 @@ func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
 	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
 	reversed := resp
 	if renamed {
-		reversed = reverseRemapOAuthToolNames(resp)
+		reversed = reverseRemapOAuthToolNamesWithMap(resp, reverseMap)
 	}
 	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "bash" {
 		t.Fatalf("content.0.name = %q, want %q", got, "bash")
+	}
+}
+
+func TestRemapOAuthToolNames_PrefixesNonClaudeCodeTools(t *testing.T) {
+	body := []byte(`{
+		"tools": [
+			{"name":"browser_navigate","description":"Open a URL","input_schema":{"type":"object"}},
+			{"name":"bash","description":"Run shell commands","input_schema":{"type":"object"}},
+			{"name":"mcp__chrome-devtools__click","description":"Click in Chrome","input_schema":{"type":"object"}},
+			{"type":"web_search_20250305","name":"web_search"}
+		],
+		"tool_choice":{"type":"tool","name":"browser_navigate"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	out, renamed := remapOAuthToolNames(body)
+	if !renamed {
+		t.Fatalf("renamed = false, want true for lowercase bash")
+	}
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 4 {
+		t.Fatalf("tools.# = %d, want 4; body: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "BrowserNavigate" {
+		t.Fatalf("tools.0.name = %q, want BrowserNavigate", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Bash" {
+		t.Fatalf("tools.1.name = %q, want Bash", got)
+	}
+	if got := gjson.GetBytes(out, "tools.2.name").String(); got != "mcp__chrome-devtools__click" {
+		t.Fatalf("tools.2.name = %q, want mcp__chrome-devtools__click", got)
+	}
+	if got := gjson.GetBytes(out, "tools.3.name").String(); got != "web_search" {
+		t.Fatalf("tools.3.name = %q, want web_search", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "BrowserNavigate" {
+		t.Fatalf("tool_choice.name = %q, want BrowserNavigate", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.description").String(); got != "" {
+		t.Fatalf("tools.0.description = %q, want stripped empty string", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.description").String(); got != "" {
+		t.Fatalf("tools.1.description = %q, want stripped empty string", got)
+	}
+}
+
+func TestRemapOAuthToolNames_PrefixedNamesReverseWithRequestMap(t *testing.T) {
+	body := []byte(`{
+		"tools": [
+			{"name":"browser_navigate","input_schema":{"type":"object"}},
+			{"name":"mcp_chrome_devtools_click","input_schema":{"type":"object"}}
+		],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	out, renamed, reverseMap := remapOAuthToolNamesForOAuth(body)
+	if !renamed {
+		t.Fatalf("renamed = false, want true")
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "BrowserNavigate" {
+		t.Fatalf("tools.0.name = %q, want BrowserNavigate", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "ChromeDevtoolsClick" {
+		t.Fatalf("single-underscore mcp_ tool should be normalized; got %q", got)
+	}
+
+	resp := []byte(`{"content":[{"type":"tool_use","name":"BrowserNavigate","id":"toolu_01","input":{}},{"type":"tool_use","name":"ChromeDevtoolsClick","id":"toolu_02","input":{}}]}`)
+	reversed := reverseRemapOAuthToolNamesWithMap(resp, reverseMap)
+	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "browser_navigate" {
+		t.Fatalf("content.0.name = %q, want browser_navigate", got)
+	}
+	if got := gjson.GetBytes(reversed, "content.1.name").String(); got != "mcp_chrome_devtools_click" {
+		t.Fatalf("single-underscore mcp_ response name should reverse to client name; got %q", got)
+	}
+}
+
+func TestRemapOAuthToolNames_PrefixedStreamNamesReverseWithRequestMap(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"terminal","input_schema":{"type":"object"}}]}`)
+	_, renamed, reverseMap := remapOAuthToolNamesForOAuth(body)
+	if !renamed {
+		t.Fatalf("renamed = false, want true")
+	}
+
+	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Terminal","id":"toolu_01"},"index":0}`)
+	out := reverseRemapOAuthToolNamesFromStreamLineWithMap(line, reverseMap)
+	if got := gjson.GetBytes(helps.JSONPayload(out), "content_block.name").String(); got != "terminal" {
+		t.Fatalf("content_block.name = %q, want terminal; line: %s", got, string(out))
+	}
+}
+
+func TestRemapOAuthToolNames_PrefixesEveryNonClaudeCodeTool(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"browser_navigate","input_schema":{"type":"object"}},{"name":"terminal","input_schema":{"type":"object"}}]}`)
+
+	out, renamed := remapOAuthToolNames(body)
+	if !renamed {
+		t.Fatalf("renamed = false, want true")
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "BrowserNavigate" {
+		t.Fatalf("tools.0.name = %q, want BrowserNavigate", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Terminal" {
+		t.Fatalf("tools.1.name = %q, want Terminal", got)
 	}
 }
 

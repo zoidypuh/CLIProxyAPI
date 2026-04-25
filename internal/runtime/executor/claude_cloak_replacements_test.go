@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -153,6 +154,21 @@ func TestApplyClaudeCloakResponseReplacements_AppliesReverseMap(t *testing.T) {
 	}
 	if !strings.Contains(text, "OpenClaw") || !strings.Contains(text, "sessions_spawn") {
 		t.Fatalf("expected reverse mapping to restore original text, got %s", text)
+	}
+}
+
+func TestApplyTextReplacements_PreservesThinkingBlocksByteIdentical(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"OpenClaw should stay here {\"nested\":true}","signature":"sig"},{"type":"redacted_thinking","data":"OpenClaw should also stay"},{"type":"text","text":"OpenClaw should change"}]}]}`)
+	out := applyTextReplacements(body, []config.TextReplacement{{Find: "OpenClaw", Replace: "OCPlatform"}})
+
+	if !bytes.Contains(out, []byte(`{"type":"thinking","thinking":"OpenClaw should stay here {\"nested\":true}","signature":"sig"}`)) {
+		t.Fatalf("thinking block was mutated: %s", string(out))
+	}
+	if !bytes.Contains(out, []byte(`{"type":"redacted_thinking","data":"OpenClaw should also stay"}`)) {
+		t.Fatalf("redacted_thinking block was mutated: %s", string(out))
+	}
+	if !bytes.Contains(out, []byte(`"text":"OCPlatform should change"`)) {
+		t.Fatalf("text block was not replaced: %s", string(out))
 	}
 }
 

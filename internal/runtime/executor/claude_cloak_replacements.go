@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -30,14 +31,103 @@ func applyTextReplacements(body []byte, replacements []config.TextReplacement) [
 	if len(body) == 0 || len(replacements) == 0 {
 		return body
 	}
-	out := body
+	out, masks := maskClaudeThinkingBlocks(body)
 	for _, replacement := range replacements {
 		if replacement.Find == "" {
 			continue
 		}
 		out = bytes.ReplaceAll(out, []byte(replacement.Find), []byte(replacement.Replace))
 	}
+	return unmaskClaudeThinkingBlocks(out, masks)
+}
+
+type claudeThinkingBlockMask struct {
+	placeholder []byte
+	value       []byte
+}
+
+func maskClaudeThinkingBlocks(body []byte) ([]byte, []claudeThinkingBlockMask) {
+	if len(body) == 0 || (!bytes.Contains(body, []byte(`"type":"thinking"`)) && !bytes.Contains(body, []byte(`"type": "thinking"`)) && !bytes.Contains(body, []byte(`"type":"redacted_thinking"`)) && !bytes.Contains(body, []byte(`"type": "redacted_thinking"`))) {
+		return body, nil
+	}
+	out := make([]byte, 0, len(body))
+	masks := make([]claudeThinkingBlockMask, 0, 2)
+	for i := 0; i < len(body); {
+		if body[i] != '{' {
+			out = append(out, body[i])
+			i++
+			continue
+		}
+		end := findJSONObjectEnd(body, i)
+		if end <= i {
+			out = append(out, body[i])
+			i++
+			continue
+		}
+		raw := body[i : end+1]
+		switch gjson.GetBytes(raw, "type").String() {
+		case "thinking", "redacted_thinking":
+			placeholder := []byte(fmt.Sprintf("__CLIPROXY_THINK_MASK_%d__", len(masks)))
+			masks = append(masks, claudeThinkingBlockMask{
+				placeholder: placeholder,
+				value:       append([]byte(nil), raw...),
+			})
+			out = append(out, placeholder...)
+			i = end + 1
+			continue
+		}
+		out = append(out, body[i])
+		i++
+	}
+	if len(masks) == 0 {
+		return body, nil
+	}
+	return out, masks
+}
+
+func unmaskClaudeThinkingBlocks(body []byte, masks []claudeThinkingBlockMask) []byte {
+	out := body
+	for _, mask := range masks {
+		out = bytes.ReplaceAll(out, mask.placeholder, mask.value)
+	}
 	return out
+}
+
+func findJSONObjectEnd(body []byte, start int) int {
+	if start < 0 || start >= len(body) || body[start] != '{' {
+		return -1
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(body); i++ {
+		c := body[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func applyClaudeCloakRequestReplacements(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, body []byte) []byte {
