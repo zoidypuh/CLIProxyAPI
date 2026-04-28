@@ -10,7 +10,7 @@ import (
 
 const (
 	TokenKindWeightedPriceScore = "weighted_price_score"
-	WeightedPriceScoreFormula   = "5*input_tokens + 30*output_tokens + 0.5*cached_tokens"
+	WeightedPriceScoreFormula   = "5*input_tokens + 30*output_tokens - 4.5*cached_tokens"
 )
 
 // StatisticsSnapshotV2 exposes a UI-friendly usage view grouped by client API key,
@@ -337,7 +337,8 @@ func SubscriptionUsageScoreForCalibrationScope(snapshot StatisticsSnapshotV2, pr
 }
 
 // WeightedPriceScoreForCalibrationScope returns the under-272K price-weighted
-// usage score: 5*input_tokens + 30*output_tokens + 0.5*cached_tokens.
+// usage score. Cached tokens are included in input_tokens by upstream usage,
+// so subtract the normal input price before applying cache-read price.
 func WeightedPriceScoreForCalibrationScope(snapshot StatisticsSnapshotV2, provider string, model string, authID string, authIndex string, app string) float64 {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	model = strings.TrimSpace(model)
@@ -376,7 +377,11 @@ func WeightedPriceScore(inputTokens int64, outputTokens int64, cachedTokens int6
 	inputTokens = nonNegativeTokenCount(inputTokens)
 	outputTokens = nonNegativeTokenCount(outputTokens)
 	cachedTokens = nonNegativeTokenCount(cachedTokens)
-	return 5*float64(inputTokens) + 30*float64(outputTokens) + 0.5*float64(cachedTokens)
+	freshInputTokens := inputTokens - cachedTokens
+	if freshInputTokens < 0 {
+		freshInputTokens = 0
+	}
+	return 5*float64(freshInputTokens) + 30*float64(outputTokens) + 0.5*float64(cachedTokens)
 }
 
 func nonNegativeTokenCount(value int64) int64 {
