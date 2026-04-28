@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -137,6 +138,10 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// UsagePercentCalibration stores manual token-to-weekly-percent calibrations
+	// used to estimate subscription usage from request token counts.
+	UsagePercentCalibration UsagePercentCalibrationConfig `yaml:"usage-percent-calibration,omitempty" json:"usage-percent-calibration,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -246,6 +251,73 @@ type OAuthModelAlias struct {
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
 	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
+}
+
+// UsagePercentCalibrationConfig stores both persisted calibrations and an
+// optional active capture session used to derive them.
+type UsagePercentCalibrationConfig struct {
+	Active       *UsagePercentCalibrationSession `yaml:"active,omitempty" json:"active,omitempty"`
+	Calibrations []UsagePercentCalibration       `yaml:"calibrations,omitempty" json:"calibrations,omitempty"`
+	Warning      UsageLimitWarningConfig         `yaml:"warning,omitempty" json:"warning,omitempty"`
+}
+
+// UsageLimitWarningConfig controls local warning injection based on persisted
+// usage-percent calibrations and in-memory usage counters.
+type UsageLimitWarningConfig struct {
+	Enabled          bool    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	ThresholdPercent float64 `yaml:"threshold-percent,omitempty" json:"threshold_percent,omitempty"`
+	Window           string  `yaml:"window,omitempty" json:"window,omitempty"`
+	Message          string  `yaml:"message,omitempty" json:"message,omitempty"`
+}
+
+// UsagePercentCalibrationSession stores the start state for an in-progress
+// calibration capture.
+type UsagePercentCalibrationSession struct {
+	Provider             string    `yaml:"provider" json:"provider"`
+	Model                string    `yaml:"model" json:"model"`
+	AuthID               string    `yaml:"auth-id,omitempty" json:"auth_id,omitempty"`
+	AuthIndex            string    `yaml:"auth-index,omitempty" json:"auth_index,omitempty"`
+	App                  string    `yaml:"app,omitempty" json:"app,omitempty"`
+	StartedAt            time.Time `yaml:"started-at,omitempty" json:"started_at,omitempty"`
+	StartPercent         float64   `yaml:"start-percent" json:"start_percent"`
+	StartFiveHourPercent float64   `yaml:"start-five-hour-percent,omitempty" json:"start_five_hour_percent,omitempty"`
+	StartWeeklyPercent   float64   `yaml:"start-weekly-percent,omitempty" json:"start_weekly_percent,omitempty"`
+	StartTokens          int64     `yaml:"start-tokens" json:"start_tokens"`
+	StartScore           float64   `yaml:"start-score,omitempty" json:"start_score,omitempty"`
+	StartOutputTokens    int64     `yaml:"start-output-tokens,omitempty" json:"start_output_tokens,omitempty"`
+	TokenKind            string    `yaml:"token-kind,omitempty" json:"token_kind,omitempty"`
+	TargetScore          float64   `yaml:"target-score,omitempty" json:"target_score,omitempty"`
+	TargetOutputTokens   int64     `yaml:"target-output-tokens,omitempty" json:"target_output_tokens,omitempty"`
+	MaxDurationSeconds   int64     `yaml:"max-duration-seconds,omitempty" json:"max_duration_seconds,omitempty"`
+}
+
+// UsagePercentCalibration stores a derived tokens-per-percent ratio for a
+// provider/model pair, optionally narrowed by auth file and app label.
+type UsagePercentCalibration struct {
+	Provider                 string    `yaml:"provider" json:"provider"`
+	Model                    string    `yaml:"model" json:"model"`
+	AuthID                   string    `yaml:"auth-id,omitempty" json:"auth_id,omitempty"`
+	AuthIndex                string    `yaml:"auth-index,omitempty" json:"auth_index,omitempty"`
+	App                      string    `yaml:"app,omitempty" json:"app,omitempty"`
+	TokenKind                string    `yaml:"token-kind,omitempty" json:"token_kind,omitempty"`
+	TokensPerPercent         float64   `yaml:"tokens-per-percent" json:"tokens_per_percent"`
+	FiveHourTokensPerPercent float64   `yaml:"five-hour-tokens-per-percent,omitempty" json:"five_hour_tokens_per_percent,omitempty"`
+	WeeklyTokensPerPercent   float64   `yaml:"weekly-tokens-per-percent,omitempty" json:"weekly_tokens_per_percent,omitempty"`
+	FiveHourTotalTokens      int64     `yaml:"five-hour-total-tokens,omitempty" json:"five_hour_total_tokens,omitempty"`
+	WeeklyTotalTokens        int64     `yaml:"weekly-total-tokens,omitempty" json:"weekly_total_tokens,omitempty"`
+	SampleTokens             int64     `yaml:"sample-tokens,omitempty" json:"sample_tokens,omitempty"`
+	SampleScore              float64   `yaml:"sample-score,omitempty" json:"sample_score,omitempty"`
+	SampleOutputTokens       int64     `yaml:"sample-output-tokens,omitempty" json:"sample_output_tokens,omitempty"`
+	SamplePercent            float64   `yaml:"sample-percent,omitempty" json:"sample_percent,omitempty"`
+	FiveHourSamplePercent    float64   `yaml:"five-hour-sample-percent,omitempty" json:"five_hour_sample_percent,omitempty"`
+	WeeklySamplePercent      float64   `yaml:"weekly-sample-percent,omitempty" json:"weekly_sample_percent,omitempty"`
+	StartPercent             float64   `yaml:"start-percent,omitempty" json:"start_percent,omitempty"`
+	EndPercent               float64   `yaml:"end-percent,omitempty" json:"end_percent,omitempty"`
+	StartFiveHourPercent     float64   `yaml:"start-five-hour-percent,omitempty" json:"start_five_hour_percent,omitempty"`
+	EndFiveHourPercent       float64   `yaml:"end-five-hour-percent,omitempty" json:"end_five_hour_percent,omitempty"`
+	StartWeeklyPercent       float64   `yaml:"start-weekly-percent,omitempty" json:"start_weekly_percent,omitempty"`
+	EndWeeklyPercent         float64   `yaml:"end-weekly-percent,omitempty" json:"end_weekly_percent,omitempty"`
+	RecordedAt               time.Time `yaml:"recorded-at,omitempty" json:"recorded_at,omitempty"`
 }
 
 // AmpModelMapping defines a model name mapping for Amp CLI requests.
@@ -696,6 +768,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+	cfg.UsagePercentCalibration = NormalizeUsagePercentCalibrationConfig(cfg.UsagePercentCalibration)
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
@@ -1043,6 +1116,216 @@ func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]stri
 		return nil
 	}
 	return out
+}
+
+// NormalizeRoutingAppName normalizes downstream app labels used for routing and usage grouping.
+func NormalizeRoutingAppName(app string) string {
+	app = strings.ToLower(strings.TrimSpace(app))
+	app = strings.ReplaceAll(app, "_", "-")
+	return app
+}
+
+// NormalizeUsagePercentCalibrationConfig trims, validates, and deduplicates
+// percent calibration entries. Invalid captures/calibrations are dropped.
+func NormalizeUsagePercentCalibrationConfig(cfg UsagePercentCalibrationConfig) UsagePercentCalibrationConfig {
+	cfg.Active = NormalizeUsagePercentCalibrationSession(cfg.Active)
+	cfg.Calibrations = NormalizeUsagePercentCalibrations(cfg.Calibrations)
+	cfg.Warning = NormalizeUsageLimitWarningConfig(cfg.Warning)
+	if cfg.Active == nil && len(cfg.Calibrations) == 0 && !cfg.Warning.Enabled {
+		return UsagePercentCalibrationConfig{}
+	}
+	return cfg
+}
+
+// NormalizeUsageLimitWarningConfig validates warning injection settings.
+func NormalizeUsageLimitWarningConfig(cfg UsageLimitWarningConfig) UsageLimitWarningConfig {
+	if !cfg.Enabled {
+		return UsageLimitWarningConfig{}
+	}
+	cfg.Window = normalizeUsageLimitWarningWindow(cfg.Window)
+	cfg.Message = strings.TrimSpace(cfg.Message)
+	if cfg.ThresholdPercent <= 0 {
+		cfg.ThresholdPercent = 85
+	}
+	if cfg.ThresholdPercent > 100 {
+		cfg.ThresholdPercent = 100
+	}
+	return cfg
+}
+
+func normalizeUsageLimitWarningWindow(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "5h", "five-hour", "five_hour", "fivehour", "primary":
+		return "five-hour"
+	case "7d", "seven-day", "seven_day", "weekly", "week", "secondary":
+		return "weekly"
+	default:
+		return "weekly"
+	}
+}
+
+// NormalizeUsagePercentCalibrationSession validates an active capture session.
+func NormalizeUsagePercentCalibrationSession(session *UsagePercentCalibrationSession) *UsagePercentCalibrationSession {
+	if session == nil {
+		return nil
+	}
+	normalized := &UsagePercentCalibrationSession{
+		Provider:             strings.ToLower(strings.TrimSpace(session.Provider)),
+		Model:                strings.TrimSpace(session.Model),
+		AuthID:               strings.TrimSpace(session.AuthID),
+		AuthIndex:            strings.TrimSpace(session.AuthIndex),
+		App:                  NormalizeRoutingAppName(session.App),
+		StartedAt:            session.StartedAt.UTC(),
+		StartPercent:         session.StartPercent,
+		StartFiveHourPercent: session.StartFiveHourPercent,
+		StartWeeklyPercent:   session.StartWeeklyPercent,
+		StartTokens:          session.StartTokens,
+		StartScore:           session.StartScore,
+		StartOutputTokens:    session.StartOutputTokens,
+		TokenKind:            normalizeUsagePercentCalibrationTokenKind(session.TokenKind),
+		TargetScore:          session.TargetScore,
+		TargetOutputTokens:   session.TargetOutputTokens,
+		MaxDurationSeconds:   session.MaxDurationSeconds,
+	}
+	if normalized.Provider == "" || normalized.Model == "" || normalized.StartPercent < 0 ||
+		normalized.StartFiveHourPercent < 0 || normalized.StartWeeklyPercent < 0 ||
+		normalized.StartTokens < 0 || normalized.StartScore < 0 || normalized.StartOutputTokens < 0 ||
+		normalized.TargetScore < 0 || normalized.TargetOutputTokens < 0 || normalized.MaxDurationSeconds < 0 {
+		return nil
+	}
+	if normalized.StartedAt.IsZero() {
+		normalized.StartedAt = time.Now().UTC()
+	}
+	return normalized
+}
+
+// NormalizeUsagePercentCalibrations trims, validates, and deduplicates
+// calibration entries. The last entry for a given scope wins.
+func NormalizeUsagePercentCalibrations(entries []UsagePercentCalibration) []UsagePercentCalibration {
+	if len(entries) == 0 {
+		return nil
+	}
+	normalized := make([]UsagePercentCalibration, 0, len(entries))
+	indexByKey := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		item := UsagePercentCalibration{
+			Provider:                 strings.ToLower(strings.TrimSpace(entry.Provider)),
+			Model:                    strings.TrimSpace(entry.Model),
+			AuthID:                   strings.TrimSpace(entry.AuthID),
+			AuthIndex:                strings.TrimSpace(entry.AuthIndex),
+			App:                      NormalizeRoutingAppName(entry.App),
+			TokenKind:                normalizeUsagePercentCalibrationTokenKind(entry.TokenKind),
+			TokensPerPercent:         entry.TokensPerPercent,
+			FiveHourTokensPerPercent: entry.FiveHourTokensPerPercent,
+			WeeklyTokensPerPercent:   entry.WeeklyTokensPerPercent,
+			FiveHourTotalTokens:      entry.FiveHourTotalTokens,
+			WeeklyTotalTokens:        entry.WeeklyTotalTokens,
+			SampleTokens:             entry.SampleTokens,
+			SampleScore:              entry.SampleScore,
+			SampleOutputTokens:       entry.SampleOutputTokens,
+			SamplePercent:            entry.SamplePercent,
+			FiveHourSamplePercent:    entry.FiveHourSamplePercent,
+			WeeklySamplePercent:      entry.WeeklySamplePercent,
+			StartPercent:             entry.StartPercent,
+			EndPercent:               entry.EndPercent,
+			StartFiveHourPercent:     entry.StartFiveHourPercent,
+			EndFiveHourPercent:       entry.EndFiveHourPercent,
+			StartWeeklyPercent:       entry.StartWeeklyPercent,
+			EndWeeklyPercent:         entry.EndWeeklyPercent,
+			RecordedAt:               entry.RecordedAt.UTC(),
+		}
+		if item.Provider == "" || item.Model == "" || item.TokensPerPercent <= 0 {
+			continue
+		}
+		if item.RecordedAt.IsZero() {
+			item.RecordedAt = time.Now().UTC()
+		}
+		key := usagePercentCalibrationKeyWithAuthIndex(item.Provider, item.Model, item.AuthID, item.AuthIndex, item.App)
+		if idx, ok := indexByKey[key]; ok {
+			normalized[idx] = item
+			continue
+		}
+		indexByKey[key] = len(normalized)
+		normalized = append(normalized, item)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func usagePercentCalibrationKeyWithAuthIndex(provider string, model string, authID string, authIndex string, app string) string {
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(provider)),
+		strings.TrimSpace(model),
+		strings.TrimSpace(authID),
+		strings.TrimSpace(authIndex),
+		NormalizeRoutingAppName(app),
+	}, "\x00")
+}
+
+func normalizeUsagePercentCalibrationTokenKind(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "output", "output_tokens", "score", "subscription_score", "subscription-usage-score":
+		return "subscription_score"
+	case "weighted_price_score", "weighted-price-score", "price_score", "price-score", "usd_score", "usd-score":
+		return "weighted_price_score"
+	default:
+		return "total"
+	}
+}
+
+// FindBestUsagePercentCalibrationForAuthIndex returns the most specific matching
+// calibration for the given provider/model/auth/auth-index/app tuple.
+func FindBestUsagePercentCalibrationForAuthIndex(entries []UsagePercentCalibration, provider string, model string, authID string, authIndex string, app string) *UsagePercentCalibration {
+	if len(entries) == 0 {
+		return nil
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.TrimSpace(model)
+	authID = strings.TrimSpace(authID)
+	authIndex = strings.TrimSpace(authIndex)
+	app = NormalizeRoutingAppName(app)
+
+	bestIndex := -1
+	bestScore := -1
+	for i := range entries {
+		entry := entries[i]
+		if entry.Provider != provider || strings.TrimSpace(entry.Model) != model {
+			continue
+		}
+		if entry.AuthID != "" && entry.AuthID != authID {
+			continue
+		}
+		if entry.AuthIndex != "" && entry.AuthIndex != authIndex {
+			continue
+		}
+		if entry.App != "" && entry.App != app {
+			continue
+		}
+		score := 0
+		if entry.AuthID != "" {
+			score += 2
+		}
+		if entry.AuthIndex != "" {
+			score += 2
+		}
+		if entry.App != "" {
+			score++
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIndex = i
+			continue
+		}
+		if score == bestScore && bestIndex >= 0 && entry.RecordedAt.After(entries[bestIndex].RecordedAt) {
+			bestIndex = i
+		}
+	}
+	if bestIndex < 0 {
+		return nil
+	}
+	return &entries[bestIndex]
 }
 
 // hashSecret hashes the given secret using bcrypt.

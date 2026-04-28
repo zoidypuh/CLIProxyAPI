@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -12,6 +14,14 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var defaultClaudePromptMarkerWords = []string{
+	"hermes agent",
+	"hermes-agent",
+	"hermes",
+	".hermes",
+	"soul.md",
+}
 
 func shouldApplyClaudeCloak(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) bool {
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
@@ -25,6 +35,34 @@ func shouldApplyClaudeCloak(ctx context.Context, cfg *config.Config, auth *clipr
 	}
 
 	return helps.ShouldCloak(cloakMode, getClientUserAgent(ctx))
+}
+
+func obfuscateDefaultClaudePromptMarkers(body []byte) []byte {
+	matcher := helps.BuildSensitiveWordMatcher(defaultClaudePromptMarkerWords)
+	return helps.ObfuscateSensitiveWords(body, matcher)
+}
+
+func obfuscateDefaultClaudePromptMarkersInRequest(req *http.Request) error {
+	if req == nil || req.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return err
+	}
+	if errClose := req.Body.Close(); errClose != nil {
+		return errClose
+	}
+	rewritten := obfuscateDefaultClaudePromptMarkers(body)
+	req.Body = io.NopCloser(bytes.NewReader(rewritten))
+	req.ContentLength = int64(len(rewritten))
+	if req.GetBody != nil {
+		snapshot := append([]byte(nil), rewritten...)
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(snapshot)), nil
+		}
+	}
+	return nil
 }
 
 func applyTextReplacements(body []byte, replacements []config.TextReplacement) []byte {

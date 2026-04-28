@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,8 @@ var (
 	schedulerOnce       sync.Once
 	schedulerConfigPath atomic.Value
 	sfGroup             singleflight.Group
+
+	managementPasswordRequiredCheckPattern = regexp.MustCompile(`if\(![A-Za-z_$][A-Za-z0-9_$]*\.trim\(\)\)\{[A-Za-z_$][A-Za-z0-9_$]*\(t\("login\.error_required"\)\);return\}`)
 )
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
@@ -310,6 +313,7 @@ func EnsureNoKeyManagementHTML(localPath string) {
 
 	content := string(data)
 	patched := content
+	patched = managementPasswordRequiredCheckPattern.ReplaceAllString(patched, `if(false){return}`)
 	replacements := map[string]string{
 		`if(!b.trim()){J(t("login.error_required"));return}`:                           `if(false&&!b.trim()){J(t("login.error_required"));return}`,
 		`remember_password_label:"Remember password"`:                                  `remember_password_label:"Remember connection"`,

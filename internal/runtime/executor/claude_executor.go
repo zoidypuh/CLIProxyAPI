@@ -214,6 +214,9 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	if err := obfuscateDefaultClaudePromptMarkersInRequest(httpReq); err != nil {
+		return nil, err
+	}
 	httpClient := helps.NewClaudeHTTPClient(e.cfg, auth)
 	return httpClient.Do(httpReq)
 }
@@ -297,6 +300,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if oauthToken {
 		bodyForUpstream, oauthToolNamesRemapped, oauthToolNameReverseMap = remapOAuthToolNamesForOAuth(bodyForUpstream)
 	}
+	bodyForUpstream = obfuscateDefaultClaudePromptMarkers(bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
@@ -487,6 +491,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if oauthToken {
 		bodyForUpstream, oauthToolNamesRemapped, oauthToolNameReverseMap = remapOAuthToolNamesForOAuth(bodyForUpstream)
 	}
+	bodyForUpstream = obfuscateDefaultClaudePromptMarkers(bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
@@ -704,6 +709,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if isClaudeOAuthToken(apiKey) {
 		body, _ = remapOAuthToolNames(body)
 	}
+	body = obfuscateDefaultClaudePromptMarkers(body)
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -1410,7 +1416,11 @@ func stripDescriptionText(value any) {
 	case map[string]any:
 		for key, child := range v {
 			if key == "description" {
-				v[key] = ""
+				if _, ok := child.(string); ok {
+					v[key] = ""
+				} else {
+					stripDescriptionText(child)
+				}
 				continue
 			}
 			stripDescriptionText(child)

@@ -52,3 +52,26 @@ func TestGetAvailableModelsInvalidatesCacheOnRegistryChanges(t *testing.T) {
 		t.Fatalf("expected model to reappear after resume, got %d", len(models))
 	}
 }
+
+func TestGetAvailableModelsKeepsTransientSuspensionsListed(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "claude", []*ModelInfo{{ID: "claude-sonnet-4-6", OwnedBy: "anthropic"}})
+
+	r.SuspendClientModel("client-1", "claude-sonnet-4-6", "unauthorized")
+
+	models := r.GetAvailableModels("openai")
+	if len(models) != 1 {
+		t.Fatalf("expected transiently suspended model to stay listed, got %d", len(models))
+	}
+	if got := models[0]["id"]; got != "claude-sonnet-4-6" {
+		t.Fatalf("expected claude-sonnet-4-6, got %v", got)
+	}
+
+	providerModels := r.GetAvailableModelsByProvider("claude")
+	if len(providerModels) != 1 {
+		t.Fatalf("expected provider listing to keep transiently suspended model, got %d", len(providerModels))
+	}
+	if got := providerModels[0].ID; got != "claude-sonnet-4-6" {
+		t.Fatalf("expected provider model claude-sonnet-4-6, got %v", got)
+	}
+}

@@ -172,6 +172,40 @@ func TestApplyTextReplacements_PreservesThinkingBlocksByteIdentical(t *testing.T
 	}
 }
 
+func TestObfuscateDefaultClaudePromptMarkers_RewritesOutboundPromptText(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"HERMES AGENT instructions from soul.md"}],"messages":[{"role":"user","content":[{"type":"text","text":"read /home/user/.hermes state"}]}]}`)
+
+	out := obfuscateDefaultClaudePromptMarkers(body)
+	text := string(out)
+	for _, marker := range []string{"HERMES AGENT", "soul.md", ".hermes"} {
+		if strings.Contains(text, marker) {
+			t.Fatalf("expected %q to be obfuscated in %s", marker, text)
+		}
+	}
+	if !strings.Contains(text, "\u200b") {
+		t.Fatalf("expected zero-width obfuscation in %s", text)
+	}
+}
+
+func TestObfuscateDefaultClaudePromptMarkersInRequest_RewritesBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{"messages":[{"role":"user","content":"hermes soul.md"}]}`))
+
+	if err := obfuscateDefaultClaudePromptMarkersInRequest(req); err != nil {
+		t.Fatalf("obfuscateDefaultClaudePromptMarkersInRequest() error = %v", err)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	text := string(body)
+	if strings.Contains(text, "hermes") || strings.Contains(text, "soul.md") {
+		t.Fatalf("expected request body markers to be obfuscated, got %s", text)
+	}
+	if req.ContentLength != int64(len(body)) {
+		t.Fatalf("ContentLength = %d, want %d", req.ContentLength, len(body))
+	}
+}
+
 func TestClaudeCloakResponseTextStream_AppliesChainedRulesLikeNonStream(t *testing.T) {
 	replacements := []config.TextReplacement{
 		{Find: "A", Replace: "B"},

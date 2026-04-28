@@ -2551,6 +2551,29 @@ func TestRemapOAuthToolNames_PrefixesNonClaudeCodeTools(t *testing.T) {
 	}
 }
 
+func TestRemapOAuthToolNames_DoesNotCorruptDescriptionPropertySchema(t *testing.T) {
+	body := []byte(`{
+		"tools": [
+			{"name":"question","description":"Ask a question","input_schema":{"type":"object","properties":{"description":{"description":"Question description","type":"string"}},"required":["description"]}}
+		],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	out, renamed, _ := remapOAuthToolNamesForOAuth(body)
+	if !renamed {
+		t.Fatalf("renamed = false, want true")
+	}
+	if got := gjson.GetBytes(out, "tools.0.description").String(); got != "" {
+		t.Fatalf("tools.0.description = %q, want stripped empty string", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.input_schema.properties.description.type").String(); got != "string" {
+		t.Fatalf("description property schema type = %q, want string; body: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.input_schema.properties.description.description").String(); got != "" {
+		t.Fatalf("description property annotation = %q, want stripped empty string", got)
+	}
+}
+
 func TestRemapOAuthToolNames_PrefixedNamesReverseWithRequestMap(t *testing.T) {
 	body := []byte(`{
 		"tools": [

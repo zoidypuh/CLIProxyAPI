@@ -209,6 +209,13 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
+// saveConfigLocked saves the current in-memory config to disk without writing a response.
+func (h *Handler) saveConfigLocked() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return config.SaveConfigPreserveComments(h.configFilePath, h.cfg)
+}
+
 // Helper methods for simple types
 func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 	var body struct {

@@ -245,6 +245,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:    wd,
 		wsRoutes:       make(map[string]struct{}),
 	}
+	s.handlers.UsageLimitWarning = s.usageLimitWarning
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
@@ -316,6 +317,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/usage-calibration.html", s.serveUsageCalibrationPage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -482,6 +484,15 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/v2", s.mgmt.GetUsageStatisticsV2)
+		mgmt.GET("/usage/percent-calibration", s.mgmt.GetUsagePercentCalibration)
+		mgmt.GET("/usage/percent-calibration/automatic", s.mgmt.GetUsagePercentCalibrationAutomatic)
+		mgmt.POST("/usage/percent-calibration/automatic/start", s.mgmt.StartUsagePercentCalibrationAutomatic)
+		mgmt.POST("/usage/percent-calibration/automatic/stop", s.mgmt.StopUsagePercentCalibrationAutomatic)
+		mgmt.POST("/usage/percent-calibration/start", s.mgmt.StartUsagePercentCalibration)
+		mgmt.POST("/usage/percent-calibration/stop", s.mgmt.StopUsagePercentCalibration)
+		mgmt.DELETE("/usage/percent-calibration/active", s.mgmt.DeleteUsagePercentCalibrationActive)
+		mgmt.DELETE("/usage/percent-calibration", s.mgmt.DeleteUsagePercentCalibration)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)
@@ -670,6 +681,20 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	managementasset.EnsureNoKeyManagementHTML(filePath)
 	c.Header("Cache-Control", "no-store")
+	c.File(filePath)
+}
+
+func (s *Server) serveUsageCalibrationPage(c *gin.Context) {
+	staticDir := managementasset.StaticDir(s.configFilePath)
+	if strings.TrimSpace(staticDir) == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	filePath := filepath.Join(staticDir, "usage-calibration.html")
+	if _, err := os.Stat(filePath); err != nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
 	c.File(filePath)
 }
 

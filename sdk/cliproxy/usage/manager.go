@@ -11,6 +11,7 @@ import (
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
 	Provider    string
+	App         string
 	Model       string
 	APIKey      string
 	AuthID      string
