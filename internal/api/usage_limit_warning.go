@@ -98,8 +98,13 @@ func tokensPerPercentForWarningWindow(calibration config.UsagePercentCalibration
 }
 
 func usageValueForCalibration(snapshot usage.StatisticsSnapshotV2, calibration config.UsagePercentCalibration, provider string, model string, authID string, authIndex string) float64 {
-	if calibration.TokenKind == "subscription_score" {
+	switch calibration.TokenKind {
+	case usage.TokenKindOutputTokens:
+		return float64(usage.OutputTokensForCalibrationScopeWithAuthIndex(snapshot, provider, model, authID, authIndex, ""))
+	case "subscription_score":
 		return usage.SubscriptionUsageScoreForCalibrationScope(snapshot, provider, model, authID, authIndex, "")
+	case usage.TokenKindWeightedPriceScore:
+		return usage.WeightedPriceScoreForCalibrationScope(snapshot, provider, model, authID, authIndex, "")
 	}
 	return float64(usage.TokensForCalibrationScopeWithAuthIndex(snapshot, provider, model, authID, authIndex, ""))
 }

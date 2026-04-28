@@ -9,6 +9,7 @@ import (
 )
 
 const (
+	TokenKindOutputTokens       = "output_tokens"
 	TokenKindWeightedPriceScore = "weighted_price_score"
 	WeightedPriceScoreFormula   = "5*input_tokens + 30*output_tokens - 4.5*cached_tokens"
 )
@@ -247,6 +248,8 @@ func ApplyUsagePercentCalibrations(snapshot *StatisticsSnapshotV2, cfg internalc
 		}
 		calibratedValue := float64(entry.TotalTokens)
 		switch calibration.TokenKind {
+		case TokenKindOutputTokens:
+			calibratedValue = float64(entry.OutputTokens)
 		case "subscription_score":
 			calibratedValue = subscriptionUsageScore(entry.InputTokens, entry.OutputTokens, entry.CachedTokens)
 		case TokenKindWeightedPriceScore:
@@ -304,6 +307,35 @@ func TokensForCalibrationScopeWithAuthIndex(snapshot StatisticsSnapshotV2, provi
 			continue
 		}
 		total += entry.TotalTokens
+	}
+	return total
+}
+
+// OutputTokensForCalibrationScopeWithAuthIndex returns the tracked output tokens
+// for a provider/model/auth/auth-index/app selector using the aggregated V2
+// entries.
+func OutputTokensForCalibrationScopeWithAuthIndex(snapshot StatisticsSnapshotV2, provider string, model string, authID string, authIndex string, app string) int64 {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.TrimSpace(model)
+	authID = strings.TrimSpace(authID)
+	authIndex = strings.TrimSpace(authIndex)
+	app = internalconfig.NormalizeRoutingAppName(app)
+
+	var total int64
+	for _, entry := range snapshot.Entries {
+		if entry.Provider != provider || strings.TrimSpace(entry.Model) != model {
+			continue
+		}
+		if authID != "" && entry.AuthID != authID {
+			continue
+		}
+		if authIndex != "" && entry.AuthIndex != authIndex {
+			continue
+		}
+		if app != "" && entry.App != app {
+			continue
+		}
+		total += entry.OutputTokens
 	}
 	return total
 }

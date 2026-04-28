@@ -229,12 +229,12 @@ func TestUsagePercentCalibrationFallsBackWhenAppScopeRegresses(t *testing.T) {
 		StartTokens: 100,
 		StartScore:  100,
 	}
-	currentTokens, currentScore := currentCalibrationUsage(stats.SnapshotV2(), session)
-	if currentTokens != 150 {
-		t.Fatalf("current_tokens = %d, want fallback total 150", currentTokens)
+	currentUsage := currentCalibrationUsage(stats.SnapshotV2(), session)
+	if currentUsage.tokens != 150 {
+		t.Fatalf("current_tokens = %d, want fallback total 150", currentUsage.tokens)
 	}
-	if currentScore != 150 {
-		t.Fatalf("current_score = %v, want fallback total 150", currentScore)
+	if currentUsage.score != 150 {
+		t.Fatalf("current_score = %v, want fallback total 150", currentUsage.score)
 	}
 }
 
@@ -429,7 +429,7 @@ func TestUsagePercentCalibrationAutomaticCandidatesUseObservedUsageModels(t *tes
 	}
 }
 
-func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
+func TestUsagePercentCalibrationAutomaticCodexOutputTokensAndBorder(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -448,7 +448,7 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 		t.Fatalf("os.WriteFile(auth): %v", err)
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
-	authID := "auto-weighted-" + strings.ReplaceAll(t.Name(), "/", "-")
+	authID := "auto-output-" + strings.ReplaceAll(t.Name(), "/", "-")
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
 		ID:         authID,
 		Provider:   "codex",
@@ -459,7 +459,7 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-auto-weighted"}})
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-auto-output"}})
 
 	h := NewHandler(cfg, configPath, manager)
 	stats := usage.NewRequestStatistics()
@@ -469,7 +469,7 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 	startCtx, _ := gin.CreateTestContext(startRec)
 	startCtx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/usage/percent-calibration/automatic/start", strings.NewReader(`{
 		"auth_id":"`+authID+`",
-		"model":"gpt-auto-weighted",
+		"model":"gpt-auto-output",
 		"current_percent":10
 	}`))
 	startCtx.Request.Header.Set("Content-Type", "application/json")
@@ -480,21 +480,21 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 	if h.cfg.UsagePercentCalibration.Active == nil {
 		t.Fatalf("active calibration = nil, want non-nil")
 	}
-	if h.cfg.UsagePercentCalibration.Active.TokenKind != usage.TokenKindWeightedPriceScore {
-		t.Fatalf("token_kind = %q, want %q", h.cfg.UsagePercentCalibration.Active.TokenKind, usage.TokenKindWeightedPriceScore)
+	if h.cfg.UsagePercentCalibration.Active.TokenKind != usage.TokenKindOutputTokens {
+		t.Fatalf("token_kind = %q, want %q", h.cfg.UsagePercentCalibration.Active.TokenKind, usage.TokenKindOutputTokens)
 	}
 	authIndex := h.cfg.UsagePercentCalibration.Active.AuthIndex
 
 	stats.Record(nil, coreusage.Record{
 		Provider:    "codex",
-		Model:       "gpt-auto-weighted",
+		Model:       "gpt-auto-output",
 		AuthID:      authID,
 		AuthIndex:   authIndex,
 		APIKey:      "client-a",
 		RequestedAt: time.Date(2026, 4, 10, 3, 5, 0, 0, time.UTC),
 		Detail: coreusage.Detail{
-			InputTokens: 49999,
-			TotalTokens: 49999,
+			OutputTokens: 4999,
+			TotalTokens:  4999,
 		},
 	})
 
@@ -511,14 +511,14 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 
 	stats.Record(nil, coreusage.Record{
 		Provider:    "codex",
-		Model:       "gpt-auto-weighted",
+		Model:       "gpt-auto-output",
 		AuthID:      authID,
 		AuthIndex:   authIndex,
 		APIKey:      "client-a",
 		RequestedAt: time.Date(2026, 4, 10, 3, 6, 0, 0, time.UTC),
 		Detail: coreusage.Detail{
-			InputTokens: 1,
-			TotalTokens: 1,
+			OutputTokens: 1,
+			TotalTokens:  1,
 		},
 	})
 
@@ -539,16 +539,16 @@ func TestUsagePercentCalibrationAutomaticWeightedScoreAndBorder(t *testing.T) {
 	if err := json.Unmarshal(stopRec.Body.Bytes(), &stopBody); err != nil {
 		t.Fatalf("json.Unmarshal(stop): %v", err)
 	}
-	if stopBody.Calibration.SampleTokens != 50000 {
-		t.Fatalf("sample_tokens = %d, want 50000", stopBody.Calibration.SampleTokens)
+	if stopBody.Calibration.SampleTokens != 5000 {
+		t.Fatalf("sample_tokens = %d, want 5000", stopBody.Calibration.SampleTokens)
 	}
-	if math.Abs(stopBody.Calibration.SampleScore-250000) > 0.0001 {
-		t.Fatalf("sample_score = %v, want 250000", stopBody.Calibration.SampleScore)
+	if stopBody.Calibration.SampleOutputTokens != 5000 {
+		t.Fatalf("sample_output_tokens = %d, want 5000", stopBody.Calibration.SampleOutputTokens)
 	}
-	if math.Abs(stopBody.Calibration.TokensPerPercent-250000) > 0.0001 {
-		t.Fatalf("tokens_per_percent = %v, want 250000", stopBody.Calibration.TokensPerPercent)
+	if math.Abs(stopBody.Calibration.TokensPerPercent-5000) > 0.0001 {
+		t.Fatalf("tokens_per_percent = %v, want 5000", stopBody.Calibration.TokensPerPercent)
 	}
-	if stopBody.Calibration.TokenKind != usage.TokenKindWeightedPriceScore {
-		t.Fatalf("token_kind = %q, want %q", stopBody.Calibration.TokenKind, usage.TokenKindWeightedPriceScore)
+	if stopBody.Calibration.TokenKind != usage.TokenKindOutputTokens {
+		t.Fatalf("token_kind = %q, want %q", stopBody.Calibration.TokenKind, usage.TokenKindOutputTokens)
 	}
 }

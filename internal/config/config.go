@@ -1266,7 +1266,9 @@ func usagePercentCalibrationKeyWithAuthIndex(provider string, model string, auth
 
 func normalizeUsagePercentCalibrationTokenKind(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "output", "output_tokens", "score", "subscription_score", "subscription-usage-score":
+	case "output", "output_tokens":
+		return "output_tokens"
+	case "score", "subscription_score", "subscription-usage-score":
 		return "subscription_score"
 	case "weighted_price_score", "weighted-price-score", "price_score", "price-score", "usd_score", "usd-score":
 		return "weighted_price_score"

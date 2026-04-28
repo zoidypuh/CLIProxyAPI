@@ -16,7 +16,10 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
-const automaticCalibrationSampleBorderTokens int64 = 50000
+const (
+	automaticCalibrationSampleBorderTokens       int64 = 50000
+	automaticCalibrationSampleBorderOutputTokens int64 = 5000
+)
 
 type usageExportPayload struct {
 	Version    int                      `json:"version"`
@@ -63,10 +66,12 @@ type usagePercentCalibrationState struct {
 
 type usagePercentCalibrationActive struct {
 	config.UsagePercentCalibrationSession
-	CurrentTokens int64   `json:"current_tokens"`
-	SampleTokens  int64   `json:"sample_tokens"`
-	CurrentScore  float64 `json:"current_score,omitempty"`
-	SampleScore   float64 `json:"sample_score,omitempty"`
+	CurrentTokens       int64   `json:"current_tokens"`
+	SampleTokens        int64   `json:"sample_tokens"`
+	CurrentOutputTokens int64   `json:"current_output_tokens,omitempty"`
+	SampleOutputTokens  int64   `json:"sample_output_tokens,omitempty"`
+	CurrentScore        float64 `json:"current_score,omitempty"`
+	SampleScore         float64 `json:"sample_score,omitempty"`
 }
 
 type usagePercentCalibrationStartRequest struct {
@@ -90,11 +95,12 @@ type usagePercentCalibrationStopRequest struct {
 }
 
 type usagePercentCalibrationAutomaticState struct {
-	SampleBorderTokens int64                                       `json:"sample_border_tokens"`
-	ScoreFormula       string                                      `json:"score_formula"`
-	Candidates         []usagePercentCalibrationAutomaticCandidate `json:"candidates"`
-	Active             *usagePercentCalibrationAutomaticActive     `json:"active,omitempty"`
-	Calibrations       []config.UsagePercentCalibration            `json:"calibrations,omitempty"`
+	SampleBorderTokens       int64                                       `json:"sample_border_tokens"`
+	SampleBorderOutputTokens int64                                       `json:"sample_border_output_tokens"`
+	ScoreFormula             string                                      `json:"score_formula"`
+	Candidates               []usagePercentCalibrationAutomaticCandidate `json:"candidates"`
+	Active                   *usagePercentCalibrationAutomaticActive     `json:"active,omitempty"`
+	Calibrations             []config.UsagePercentCalibration            `json:"calibrations,omitempty"`
 }
 
 type usagePercentCalibrationAutomaticCandidate struct {
@@ -104,14 +110,18 @@ type usagePercentCalibrationAutomaticCandidate struct {
 
 type usagePercentCalibrationAutomaticActive struct {
 	config.UsagePercentCalibrationSession
-	CurrentTokens      int64   `json:"current_tokens"`
-	SampleTokens       int64   `json:"sample_tokens"`
-	RemainingTokens    int64   `json:"remaining_tokens"`
-	SampleBorderTokens int64   `json:"sample_border_tokens"`
-	Ready              bool    `json:"ready"`
-	CurrentScore       float64 `json:"current_score,omitempty"`
-	SampleScore        float64 `json:"sample_score,omitempty"`
-	ScoreFormula       string  `json:"score_formula"`
+	CurrentTokens            int64   `json:"current_tokens"`
+	SampleTokens             int64   `json:"sample_tokens"`
+	RemainingTokens          int64   `json:"remaining_tokens"`
+	SampleBorderTokens       int64   `json:"sample_border_tokens"`
+	CurrentOutputTokens      int64   `json:"current_output_tokens,omitempty"`
+	SampleOutputTokens       int64   `json:"sample_output_tokens,omitempty"`
+	RemainingOutputTokens    int64   `json:"remaining_output_tokens,omitempty"`
+	SampleBorderOutputTokens int64   `json:"sample_border_output_tokens,omitempty"`
+	Ready                    bool    `json:"ready"`
+	CurrentScore             float64 `json:"current_score,omitempty"`
+	SampleScore              float64 `json:"sample_score,omitempty"`
+	ScoreFormula             string  `json:"score_formula"`
 }
 
 type usagePercentCalibrationAutomaticStartRequest struct {
@@ -125,6 +135,12 @@ type usagePercentCalibrationAutomaticStartRequest struct {
 	CurrentWeeklyPercent   float64 `json:"current_weekly_percent"`
 }
 
+type calibrationUsageValues struct {
+	tokens       int64
+	score        float64
+	outputTokens int64
+}
+
 func (h *Handler) GetUsagePercentCalibration(c *gin.Context) {
 	state := usagePercentCalibrationState{}
 	if h == nil || h.cfg == nil {
@@ -135,13 +151,15 @@ func (h *Handler) GetUsagePercentCalibration(c *gin.Context) {
 	state.Calibrations = cfg.Calibrations
 	if cfg.Active != nil && h.usageStats != nil {
 		snapshot := h.usageStats.SnapshotV2()
-		currentTokens, currentScore := currentCalibrationUsage(snapshot, cfg.Active)
+		currentUsage := currentCalibrationUsage(snapshot, cfg.Active)
 		state.Active = &usagePercentCalibrationActive{
 			UsagePercentCalibrationSession: *cfg.Active,
-			CurrentTokens:                  currentTokens,
-			SampleTokens:                   nonNegativeInt64(currentTokens - cfg.Active.StartTokens),
-			CurrentScore:                   currentScore,
-			SampleScore:                    nonNegativeFloat64(currentScore - cfg.Active.StartScore),
+			CurrentTokens:                  currentUsage.tokens,
+			SampleTokens:                   nonNegativeInt64(currentUsage.tokens - cfg.Active.StartTokens),
+			CurrentOutputTokens:            currentUsage.outputTokens,
+			SampleOutputTokens:             nonNegativeInt64(currentUsage.outputTokens - cfg.Active.StartOutputTokens),
+			CurrentScore:                   currentUsage.score,
+			SampleScore:                    nonNegativeFloat64(currentUsage.score - cfg.Active.StartScore),
 		}
 	}
 	c.JSON(http.StatusOK, state)
@@ -150,8 +168,9 @@ func (h *Handler) GetUsagePercentCalibration(c *gin.Context) {
 // GetUsagePercentCalibrationAutomatic returns UI-ready automatic calibration state.
 func (h *Handler) GetUsagePercentCalibrationAutomatic(c *gin.Context) {
 	state := usagePercentCalibrationAutomaticState{
-		SampleBorderTokens: automaticCalibrationSampleBorderTokens,
-		ScoreFormula:       usage.WeightedPriceScoreFormula,
+		SampleBorderTokens:       automaticCalibrationSampleBorderTokens,
+		SampleBorderOutputTokens: automaticCalibrationSampleBorderOutputTokens,
+		ScoreFormula:             usage.WeightedPriceScoreFormula,
 	}
 	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusOK, state)
@@ -160,23 +179,26 @@ func (h *Handler) GetUsagePercentCalibrationAutomatic(c *gin.Context) {
 	cfg := config.NormalizeUsagePercentCalibrationConfig(h.cfg.UsagePercentCalibration)
 	state.Calibrations = cfg.Calibrations
 	state.Candidates = h.automaticCalibrationCandidates()
-	if cfg.Active != nil && h.usageStats != nil && cfg.Active.TokenKind == usage.TokenKindWeightedPriceScore {
+	if cfg.Active != nil && h.usageStats != nil && isAutomaticCalibrationTokenKind(cfg.Active.TokenKind) {
 		snapshot := h.usageStats.SnapshotV2()
-		currentTokens, currentScore := currentCalibrationUsage(snapshot, cfg.Active)
-		sampleTokens := nonNegativeInt64(currentTokens - cfg.Active.StartTokens)
-		sampleScore := nonNegativeFloat64(currentScore - cfg.Active.StartScore)
-		remainingTokens := automaticCalibrationSampleBorderTokens - sampleTokens
-		if remainingTokens < 0 {
-			remainingTokens = 0
-		}
+		currentUsage := currentCalibrationUsage(snapshot, cfg.Active)
+		sampleTokens := nonNegativeInt64(currentUsage.tokens - cfg.Active.StartTokens)
+		sampleScore := nonNegativeFloat64(currentUsage.score - cfg.Active.StartScore)
+		sampleOutputTokens := nonNegativeInt64(currentUsage.outputTokens - cfg.Active.StartOutputTokens)
+		remainingTokens := automaticRemainingTokens(sampleTokens)
+		remainingOutputTokens := automaticRemainingOutputTokens(sampleOutputTokens)
 		state.Active = &usagePercentCalibrationAutomaticActive{
 			UsagePercentCalibrationSession: *cfg.Active,
-			CurrentTokens:                  currentTokens,
+			CurrentTokens:                  currentUsage.tokens,
 			SampleTokens:                   sampleTokens,
 			RemainingTokens:                remainingTokens,
 			SampleBorderTokens:             automaticCalibrationSampleBorderTokens,
-			Ready:                          sampleTokens >= automaticCalibrationSampleBorderTokens,
-			CurrentScore:                   currentScore,
+			CurrentOutputTokens:            currentUsage.outputTokens,
+			SampleOutputTokens:             sampleOutputTokens,
+			RemainingOutputTokens:          remainingOutputTokens,
+			SampleBorderOutputTokens:       automaticCalibrationSampleBorderOutputTokens,
+			Ready:                          automaticCalibrationReady(cfg.Active.TokenKind, sampleTokens, sampleOutputTokens),
+			CurrentScore:                   currentUsage.score,
 			SampleScore:                    sampleScore,
 			ScoreFormula:                   usage.WeightedPriceScoreFormula,
 		}
@@ -214,7 +236,10 @@ func (h *Handler) StartUsagePercentCalibration(c *gin.Context) {
 	}
 	snapshot := h.usageStats.SnapshotV2()
 	session = normalizeCalibrationSessionApp(snapshot, session)
-	session.StartTokens, session.StartScore = currentCalibrationUsage(snapshot, session)
+	currentUsage := currentCalibrationUsage(snapshot, session)
+	session.StartTokens = currentUsage.tokens
+	session.StartScore = currentUsage.score
+	session.StartOutputTokens = currentUsage.outputTokens
 	h.cfg.UsagePercentCalibration.Active = session
 	h.cfg.UsagePercentCalibration = config.NormalizeUsagePercentCalibrationConfig(h.cfg.UsagePercentCalibration)
 	if err := h.saveConfigLocked(); err != nil {
@@ -226,14 +251,16 @@ func (h *Handler) StartUsagePercentCalibration(c *gin.Context) {
 			UsagePercentCalibrationSession: *session,
 			CurrentTokens:                  session.StartTokens,
 			SampleTokens:                   0,
+			CurrentOutputTokens:            session.StartOutputTokens,
+			SampleOutputTokens:             0,
 			CurrentScore:                   session.StartScore,
 			SampleScore:                    0,
 		},
 	})
 }
 
-// StartUsagePercentCalibrationAutomatic starts a weighted-score calibration for
-// a selected enabled auth file and model.
+// StartUsagePercentCalibrationAutomatic starts a provider-specific calibration
+// for a selected enabled auth file and model.
 func (h *Handler) StartUsagePercentCalibrationAutomatic(c *gin.Context) {
 	if h == nil || h.cfg == nil || h.usageStats == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
@@ -264,6 +291,7 @@ func (h *Handler) StartUsagePercentCalibrationAutomatic(c *gin.Context) {
 		return
 	}
 	auth.EnsureIndex()
+	tokenKind := automaticCalibrationTokenKind(auth.Provider)
 	session := config.NormalizeUsagePercentCalibrationSession(&config.UsagePercentCalibrationSession{
 		Provider:             auth.Provider,
 		Model:                model,
@@ -274,14 +302,17 @@ func (h *Handler) StartUsagePercentCalibrationAutomatic(c *gin.Context) {
 		StartPercent:         body.CurrentPercent,
 		StartFiveHourPercent: firstPositiveFloat(body.CurrentFiveHourPercent, body.CurrentPercent),
 		StartWeeklyPercent:   firstPositiveFloat(body.CurrentWeeklyPercent, body.CurrentPercent),
-		TokenKind:            usage.TokenKindWeightedPriceScore,
+		TokenKind:            tokenKind,
 	})
 	if session == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled auth, model, and non-negative current_percent are required"})
 		return
 	}
 	session = normalizeCalibrationSessionApp(snapshot, session)
-	session.StartTokens, session.StartScore = currentCalibrationUsage(snapshot, session)
+	currentUsage := currentCalibrationUsage(snapshot, session)
+	session.StartTokens = currentUsage.tokens
+	session.StartScore = currentUsage.score
+	session.StartOutputTokens = currentUsage.outputTokens
 	h.cfg.UsagePercentCalibration.Active = session
 	h.cfg.UsagePercentCalibration = config.NormalizeUsagePercentCalibrationConfig(h.cfg.UsagePercentCalibration)
 	if err := h.saveConfigLocked(); err != nil {
@@ -295,6 +326,10 @@ func (h *Handler) StartUsagePercentCalibrationAutomatic(c *gin.Context) {
 			SampleTokens:                   0,
 			RemainingTokens:                automaticCalibrationSampleBorderTokens,
 			SampleBorderTokens:             automaticCalibrationSampleBorderTokens,
+			CurrentOutputTokens:            session.StartOutputTokens,
+			SampleOutputTokens:             0,
+			RemainingOutputTokens:          automaticRemainingOutputTokens(0),
+			SampleBorderOutputTokens:       automaticCalibrationSampleBorderOutputTokens,
 			Ready:                          false,
 			CurrentScore:                   session.StartScore,
 			SampleScore:                    0,
@@ -304,16 +339,16 @@ func (h *Handler) StartUsagePercentCalibrationAutomatic(c *gin.Context) {
 }
 
 func (h *Handler) StopUsagePercentCalibration(c *gin.Context) {
-	h.stopUsagePercentCalibration(c, 0, false)
+	h.stopUsagePercentCalibration(c, false)
 }
 
-// StopUsagePercentCalibrationAutomatic finalizes a weighted-score calibration
-// only after at least 50k proxy-recorded tokens have been sampled.
+// StopUsagePercentCalibrationAutomatic finalizes automatic calibration only
+// after the provider-specific sample border has been reached.
 func (h *Handler) StopUsagePercentCalibrationAutomatic(c *gin.Context) {
-	h.stopUsagePercentCalibration(c, automaticCalibrationSampleBorderTokens, true)
+	h.stopUsagePercentCalibration(c, true)
 }
 
-func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens int64, requireAutomatic bool) {
+func (h *Handler) stopUsagePercentCalibration(c *gin.Context, requireAutomatic bool) {
 	if h == nil || h.cfg == nil || h.usageStats == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
@@ -323,7 +358,7 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens in
 		c.JSON(http.StatusNotFound, gin.H{"error": "no active calibration"})
 		return
 	}
-	if requireAutomatic && active.TokenKind != usage.TokenKindWeightedPriceScore {
+	if requireAutomatic && !isAutomaticCalibrationTokenKind(active.TokenKind) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "active calibration is not automatic"})
 		return
 	}
@@ -339,26 +374,26 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens in
 		return
 	}
 	snapshot := h.usageStats.SnapshotV2()
-	currentTokens, currentScore := currentCalibrationUsage(snapshot, active)
-	sampleTokens := nonNegativeInt64(currentTokens - active.StartTokens)
-	sampleScore := nonNegativeFloat64(currentScore - active.StartScore)
-	if minSampleTokens > 0 && sampleTokens < minSampleTokens {
-		remainingTokens := minSampleTokens - sampleTokens
-		if remainingTokens < 0 {
-			remainingTokens = 0
-		}
+	currentUsage := currentCalibrationUsage(snapshot, active)
+	sampleTokens := nonNegativeInt64(currentUsage.tokens - active.StartTokens)
+	sampleScore := nonNegativeFloat64(currentUsage.score - active.StartScore)
+	sampleOutputTokens := nonNegativeInt64(currentUsage.outputTokens - active.StartOutputTokens)
+	if requireAutomatic && !automaticCalibrationReady(active.TokenKind, sampleTokens, sampleOutputTokens) {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":                "sample token border not reached",
-			"sample_tokens":        sampleTokens,
-			"sample_border_tokens": minSampleTokens,
-			"remaining_tokens":     remainingTokens,
+			"error":                       "sample token border not reached",
+			"sample_tokens":               sampleTokens,
+			"sample_border_tokens":        automaticCalibrationSampleBorderTokens,
+			"remaining_tokens":            automaticRemainingTokens(sampleTokens),
+			"sample_output_tokens":        sampleOutputTokens,
+			"sample_border_output_tokens": automaticCalibrationSampleBorderOutputTokens,
+			"remaining_output_tokens":     automaticRemainingOutputTokens(sampleOutputTokens),
 		})
 		return
 	}
 	samplePercent := body.CurrentPercent - active.StartPercent
 	fiveHourSamplePercent := currentFiveHourPercent - active.StartFiveHourPercent
 	weeklySamplePercent := currentWeeklyPercent - active.StartWeeklyPercent
-	if sampleTokens <= 0 && sampleScore <= 0 {
+	if sampleTokens <= 0 && sampleScore <= 0 && sampleOutputTokens <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no tracked tokens were recorded for the selected scope"})
 		return
 	}
@@ -367,7 +402,9 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens in
 		return
 	}
 	calibrationValue := float64(sampleTokens)
-	if active.TokenKind == "subscription_score" || active.TokenKind == usage.TokenKindWeightedPriceScore {
+	if active.TokenKind == usage.TokenKindOutputTokens {
+		calibrationValue = float64(sampleOutputTokens)
+	} else if active.TokenKind == "subscription_score" || active.TokenKind == usage.TokenKindWeightedPriceScore {
 		calibrationValue = sampleScore
 	}
 	tokensPerPercent := calibrationValue / samplePercent
@@ -405,6 +442,7 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens in
 		WeeklyTotalTokens:        int64(weeklyTokensPerPercent * 100),
 		SampleTokens:             sampleTokens,
 		SampleScore:              sampleScore,
+		SampleOutputTokens:       sampleOutputTokens,
 		SamplePercent:            samplePercent,
 		FiveHourSamplePercent:    fiveHourSamplePercent,
 		WeeklySamplePercent:      weeklySamplePercent,
@@ -429,27 +467,27 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, minSampleTokens in
 	})
 }
 
-func currentCalibrationUsage(snapshot usage.StatisticsSnapshotV2, session *config.UsagePercentCalibrationSession) (int64, float64) {
+func currentCalibrationUsage(snapshot usage.StatisticsSnapshotV2, session *config.UsagePercentCalibrationSession) calibrationUsageValues {
 	if session == nil {
-		return 0, 0
+		return calibrationUsageValues{}
 	}
-	tokens, score := currentCalibrationUsageForApp(snapshot, session, session.App)
-	if strings.TrimSpace(session.App) != "" && calibrationUsageRegressed(session, tokens, score) {
-		fallbackTokens, fallbackScore := currentCalibrationUsageForApp(snapshot, session, "")
-		if !calibrationUsageRegressed(session, fallbackTokens, fallbackScore) {
-			return fallbackTokens, fallbackScore
+	values := currentCalibrationUsageForApp(snapshot, session, session.App)
+	if strings.TrimSpace(session.App) != "" && calibrationUsageRegressed(session, values) {
+		fallback := currentCalibrationUsageForApp(snapshot, session, "")
+		if !calibrationUsageRegressed(session, fallback) {
+			return fallback
 		}
 	}
-	return tokens, score
+	return values
 }
 
 func normalizeCalibrationSessionApp(snapshot usage.StatisticsSnapshotV2, session *config.UsagePercentCalibrationSession) *config.UsagePercentCalibrationSession {
 	if session == nil || strings.TrimSpace(session.App) == "" {
 		return session
 	}
-	appTokens, appScore := currentCalibrationUsageForApp(snapshot, session, session.App)
-	broadTokens, broadScore := currentCalibrationUsageForApp(snapshot, session, "")
-	if calibrationUsageValue(session, appTokens, appScore) <= 0 && calibrationUsageValue(session, broadTokens, broadScore) > 0 {
+	appValues := currentCalibrationUsageForApp(snapshot, session, session.App)
+	broadValues := currentCalibrationUsageForApp(snapshot, session, "")
+	if calibrationUsageValue(session, appValues) <= 0 && calibrationUsageValue(session, broadValues) > 0 {
 		normalized := *session
 		normalized.App = ""
 		return &normalized
@@ -457,28 +495,92 @@ func normalizeCalibrationSessionApp(snapshot usage.StatisticsSnapshotV2, session
 	return session
 }
 
-func currentCalibrationUsageForApp(snapshot usage.StatisticsSnapshotV2, session *config.UsagePercentCalibrationSession, app string) (int64, float64) {
+func currentCalibrationUsageForApp(snapshot usage.StatisticsSnapshotV2, session *config.UsagePercentCalibrationSession, app string) calibrationUsageValues {
 	tokens := usage.TokensForCalibrationScopeWithAuthIndex(snapshot, session.Provider, session.Model, session.AuthID, session.AuthIndex, app)
+	outputTokens := usage.OutputTokensForCalibrationScopeWithAuthIndex(snapshot, session.Provider, session.Model, session.AuthID, session.AuthIndex, app)
 	switch session.TokenKind {
 	case "subscription_score":
 		score := usage.SubscriptionUsageScoreForCalibrationScope(snapshot, session.Provider, session.Model, session.AuthID, session.AuthIndex, app)
-		return tokens, score
+		return calibrationUsageValues{tokens: tokens, score: score, outputTokens: outputTokens}
 	case usage.TokenKindWeightedPriceScore:
 		score := usage.WeightedPriceScoreForCalibrationScope(snapshot, session.Provider, session.Model, session.AuthID, session.AuthIndex, app)
-		return tokens, score
+		return calibrationUsageValues{tokens: tokens, score: score, outputTokens: outputTokens}
+	case usage.TokenKindOutputTokens:
+		score := usage.WeightedPriceScoreForCalibrationScope(snapshot, session.Provider, session.Model, session.AuthID, session.AuthIndex, app)
+		return calibrationUsageValues{tokens: tokens, score: score, outputTokens: outputTokens}
 	}
-	return tokens, float64(tokens)
+	return calibrationUsageValues{tokens: tokens, score: float64(tokens), outputTokens: outputTokens}
 }
 
-func calibrationUsageRegressed(session *config.UsagePercentCalibrationSession, tokens int64, score float64) bool {
-	return calibrationUsageValue(session, tokens, score) < calibrationUsageValue(session, session.StartTokens, session.StartScore)
+func calibrationUsageRegressed(session *config.UsagePercentCalibrationSession, values calibrationUsageValues) bool {
+	return calibrationUsageValue(session, values) < calibrationUsageStartValue(session)
 }
 
-func calibrationUsageValue(session *config.UsagePercentCalibrationSession, tokens int64, score float64) float64 {
-	if session != nil && (session.TokenKind == "subscription_score" || session.TokenKind == usage.TokenKindWeightedPriceScore) {
-		return score
+func calibrationUsageValue(session *config.UsagePercentCalibrationSession, values calibrationUsageValues) float64 {
+	if session == nil {
+		return float64(values.tokens)
 	}
-	return float64(tokens)
+	switch session.TokenKind {
+	case usage.TokenKindOutputTokens:
+		return float64(values.outputTokens)
+	case "subscription_score", usage.TokenKindWeightedPriceScore:
+		return values.score
+	default:
+		return float64(values.tokens)
+	}
+}
+
+func calibrationUsageStartValue(session *config.UsagePercentCalibrationSession) float64 {
+	if session == nil {
+		return 0
+	}
+	switch session.TokenKind {
+	case usage.TokenKindOutputTokens:
+		return float64(session.StartOutputTokens)
+	case "subscription_score", usage.TokenKindWeightedPriceScore:
+		return session.StartScore
+	default:
+		return float64(session.StartTokens)
+	}
+}
+
+func automaticCalibrationTokenKind(provider string) string {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return usage.TokenKindOutputTokens
+	}
+	return usage.TokenKindWeightedPriceScore
+}
+
+func isAutomaticCalibrationTokenKind(tokenKind string) bool {
+	switch tokenKind {
+	case usage.TokenKindOutputTokens, usage.TokenKindWeightedPriceScore:
+		return true
+	default:
+		return false
+	}
+}
+
+func automaticCalibrationReady(tokenKind string, sampleTokens int64, sampleOutputTokens int64) bool {
+	if tokenKind == usage.TokenKindOutputTokens {
+		return sampleOutputTokens >= automaticCalibrationSampleBorderOutputTokens
+	}
+	return sampleTokens >= automaticCalibrationSampleBorderTokens
+}
+
+func automaticRemainingTokens(sampleTokens int64) int64 {
+	remainingTokens := automaticCalibrationSampleBorderTokens - sampleTokens
+	if remainingTokens < 0 {
+		return 0
+	}
+	return remainingTokens
+}
+
+func automaticRemainingOutputTokens(sampleOutputTokens int64) int64 {
+	remainingTokens := automaticCalibrationSampleBorderOutputTokens - sampleOutputTokens
+	if remainingTokens < 0 {
+		return 0
+	}
+	return remainingTokens
 }
 
 func nonNegativeInt64(value int64) int64 {
