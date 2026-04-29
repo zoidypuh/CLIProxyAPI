@@ -2,10 +2,7 @@
   "use strict";
 
   var USAGE_HASH = "#/usage";
-  var REQUEST_EVENTS_TITLE = "Request Events";
-  var CREDENTIAL_STATS_TITLE = "Credential Statistics";
   var AUTO_CALIBRATION_TITLE = "Automatic Calibration";
-  var API_DETAILS_TITLE = "API Details";
 
   function normalizedText(el) {
     return (el && el.textContent || "").replace(/\s+/g, " ").trim();
@@ -48,41 +45,15 @@
     return best;
   }
 
-  function insertAfter(reference, node) {
-    if (!reference || !node || !reference.parentElement || reference === node) {
-      return false;
-    }
-    var parent = reference.parentElement;
-    if (node.parentElement !== parent) {
-      return false;
-    }
-    if (reference.nextSibling === node) {
-      return false;
-    }
-    parent.insertBefore(node, reference.nextSibling);
-    return true;
-  }
-
   function adjustUsageDetails() {
     if (window.location.hash !== USAGE_HASH) {
       return;
     }
 
-    var requestEvents = findCard(REQUEST_EVENTS_TITLE);
-    var credentialStats = findCard(CREDENTIAL_STATS_TITLE);
     var automaticCalibration = findCard(AUTO_CALIBRATION_TITLE);
-    var apiDetails = findCard(API_DETAILS_TITLE);
 
     if (automaticCalibration) {
       automaticCalibration.remove();
-    }
-
-    if (requestEvents && credentialStats && requestEvents.parentElement === credentialStats.parentElement) {
-      credentialStats.parentElement.insertBefore(requestEvents, credentialStats);
-    }
-
-    if (apiDetails && requestEvents && apiDetails.parentElement === requestEvents.parentElement) {
-      insertAfter(requestEvents, apiDetails);
     }
   }
 
