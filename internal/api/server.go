@@ -317,7 +317,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
-	s.engine.GET("/usage-calibration.html", s.serveUsageCalibrationPage)
+	s.engine.GET("/management-local-overrides.js", s.serveManagementLocalOverrides)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -684,17 +684,19 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	c.File(filePath)
 }
 
-func (s *Server) serveUsageCalibrationPage(c *gin.Context) {
+func (s *Server) serveManagementLocalOverrides(c *gin.Context) {
 	staticDir := managementasset.StaticDir(s.configFilePath)
 	if strings.TrimSpace(staticDir) == "" {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-	filePath := filepath.Join(staticDir, "usage-calibration.html")
+	filePath := filepath.Join(staticDir, "management-local-overrides.js")
 	if _, err := os.Stat(filePath); err != nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	c.Header("Content-Type", "application/javascript; charset=utf-8")
+	c.Header("Cache-Control", "no-store")
 	c.File(filePath)
 }
 
