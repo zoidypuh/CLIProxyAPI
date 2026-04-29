@@ -287,6 +287,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Register management routes; middleware restricts remote access unless enabled.
 	s.managementRoutesEnabled.Store(true)
+	redisqueue.SetEnabled(managementQueueEnabled(cfg, s.localPassword))
 	s.registerManagementRoutes()
 
 	if optionState.keepAliveEnabled {
@@ -658,6 +659,17 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 	}
 }
 
+func managementQueueEnabled(cfg *config.Config, localPassword string) bool {
+	if strings.TrimSpace(localPassword) != "" {
+		return true
+	}
+	if cfg != nil && strings.TrimSpace(cfg.RemoteManagement.SecretKey) != "" {
+		return true
+	}
+	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
+	return strings.TrimSpace(envSecret) != ""
+}
+
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	cfg := s.cfg
 	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
@@ -949,6 +961,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	s.managementRoutesEnabled.Store(true)
+	redisqueue.SetEnabled(managementQueueEnabled(cfg, s.localPassword))
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg

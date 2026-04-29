@@ -46,7 +46,7 @@ func (s *Server) handleRedisConnection(conn net.Conn, reader *bufio.Reader) {
 	}
 
 	for {
-		if !s.managementRoutesEnabled.Load() {
+		if !redisqueue.Enabled() {
 			return
 		}
 

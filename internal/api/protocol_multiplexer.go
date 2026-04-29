@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -83,7 +84,7 @@ func (s *Server) acceptMuxConnections(listener net.Listener, httpListener *muxLi
 		}
 
 		if isRedisRESPPrefix(prefix[0]) {
-			if !s.managementRoutesEnabled.Load() {
+			if !redisqueue.Enabled() {
 				if errClose := conn.Close(); errClose != nil {
 					log.Errorf("failed to close redis connection while management is disabled: %v", errClose)
 				}
