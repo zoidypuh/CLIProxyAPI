@@ -1,9 +1,12 @@
 # Binaries
 cli-proxy-api
 *.exe
+cliproxyapi.bak-*
+cliproxyapi.log
 
 # Configuration
 config.yaml
+config.yaml.bak-*
 .env
 
 # Generated content

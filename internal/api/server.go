@@ -365,6 +365,12 @@ func (s *Server) setupRoutes() {
 			"endpoints": []string{
 				"POST /v1/chat/completions",
 				"POST /v1/completions",
+				"GET /v1/responses",
+				"POST /v1/responses",
+				"POST /v1/responses/compact",
+				"GET /backend-api/codex/responses",
+				"POST /backend-api/codex/responses",
+				"POST /backend-api/codex/responses/compact",
 				"GET /v1/models",
 			},
 		})

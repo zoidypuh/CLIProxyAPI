@@ -207,6 +207,73 @@ func TestUsagePercentCalibrationSubscriptionScore(t *testing.T) {
 	}
 }
 
+func TestUsagePercentCalibrationStopIgnoresRegressedFiveHourWindow(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("routing:\n  strategy: round-robin\n"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(config): %v", err)
+	}
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(): %v", err)
+	}
+	cfg.UsagePercentCalibration.Active = &config.UsagePercentCalibrationSession{
+		Provider:             "codex",
+		Model:                "gpt-5.5",
+		AuthID:               "codex-auth",
+		AuthIndex:            "7",
+		StartPercent:         14,
+		StartFiveHourPercent: 14,
+		StartWeeklyPercent:   14,
+		TokenKind:            usage.TokenKindOutputTokens,
+	}
+	h := NewHandler(cfg, configPath, nil)
+	stats := usage.NewRequestStatistics()
+	stats.Record(nil, coreusage.Record{
+		Provider:  "codex",
+		Model:     "gpt-5.5",
+		AuthID:    "codex-auth",
+		AuthIndex: "7",
+		APIKey:    "client-a",
+		Detail: coreusage.Detail{
+			OutputTokens: 6000,
+			TotalTokens:  6000,
+		},
+	})
+	h.SetUsageStatistics(stats)
+
+	stopRec := httptest.NewRecorder()
+	stopCtx, _ := gin.CreateTestContext(stopRec)
+	stopCtx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/usage/percent-calibration/automatic/stop", strings.NewReader(`{
+		"current_percent":15,
+		"current_five_hour_percent":1,
+		"current_weekly_percent":15
+	}`))
+	stopCtx.Request.Header.Set("Content-Type", "application/json")
+	h.StopUsagePercentCalibrationAutomatic(stopCtx)
+	if stopRec.Code != http.StatusOK {
+		t.Fatalf("Stop status = %d, want %d, body=%s", stopRec.Code, http.StatusOK, stopRec.Body.String())
+	}
+
+	var stopBody struct {
+		Calibration config.UsagePercentCalibration `json:"calibration"`
+	}
+	if err := json.Unmarshal(stopRec.Body.Bytes(), &stopBody); err != nil {
+		t.Fatalf("json.Unmarshal(stop): %v", err)
+	}
+	if stopBody.Calibration.FiveHourTokensPerPercent != 0 {
+		t.Fatalf("five_hour_tokens_per_percent = %v, want 0", stopBody.Calibration.FiveHourTokensPerPercent)
+	}
+	if math.Abs(stopBody.Calibration.WeeklyTokensPerPercent-6000) > 0.0001 {
+		t.Fatalf("weekly_tokens_per_percent = %v, want 6000", stopBody.Calibration.WeeklyTokensPerPercent)
+	}
+	if math.Abs(stopBody.Calibration.TokensPerPercent-6000) > 0.0001 {
+		t.Fatalf("tokens_per_percent = %v, want 6000", stopBody.Calibration.TokensPerPercent)
+	}
+}
+
 func TestUsagePercentCalibrationFallsBackWhenAppScopeRegresses(t *testing.T) {
 	stats := usage.NewRequestStatistics()
 	stats.Record(nil, coreusage.Record{

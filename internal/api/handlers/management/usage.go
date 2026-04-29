@@ -369,7 +369,7 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, requireAutomatic b
 	}
 	currentFiveHourPercent := firstPositiveFloat(body.CurrentFiveHourPercent, body.CurrentPercent)
 	currentWeeklyPercent := firstPositiveFloat(body.CurrentWeeklyPercent, body.CurrentPercent)
-	if body.CurrentPercent < active.StartPercent || currentFiveHourPercent < active.StartFiveHourPercent || currentWeeklyPercent < active.StartWeeklyPercent {
+	if body.CurrentPercent < active.StartPercent {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "current percentages must be greater than or equal to the start percentages"})
 		return
 	}
@@ -390,9 +390,9 @@ func (h *Handler) stopUsagePercentCalibration(c *gin.Context, requireAutomatic b
 		})
 		return
 	}
-	samplePercent := body.CurrentPercent - active.StartPercent
-	fiveHourSamplePercent := currentFiveHourPercent - active.StartFiveHourPercent
-	weeklySamplePercent := currentWeeklyPercent - active.StartWeeklyPercent
+	samplePercent := usagePercentDelta(body.CurrentPercent, active.StartPercent)
+	fiveHourSamplePercent := usagePercentDelta(currentFiveHourPercent, active.StartFiveHourPercent)
+	weeklySamplePercent := usagePercentDelta(currentWeeklyPercent, active.StartWeeklyPercent)
 	if sampleTokens <= 0 && sampleScore <= 0 && sampleOutputTokens <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no tracked tokens were recorded for the selected scope"})
 		return
@@ -581,6 +581,13 @@ func automaticRemainingOutputTokens(sampleOutputTokens int64) int64 {
 		return 0
 	}
 	return remainingTokens
+}
+
+func usagePercentDelta(current float64, start float64) float64 {
+	if current <= start {
+		return 0
+	}
+	return current - start
 }
 
 func nonNegativeInt64(value int64) int64 {

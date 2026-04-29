@@ -84,6 +84,45 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestRootEndpointAdvertisesResponsesRoutes(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		Endpoints []string `json:"endpoints"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+
+	for _, endpoint := range []string{
+		"GET /v1/responses",
+		"POST /v1/responses",
+		"POST /v1/responses/compact",
+		"GET /backend-api/codex/responses",
+		"POST /backend-api/codex/responses",
+		"POST /backend-api/codex/responses/compact",
+	} {
+		found := false
+		for _, got := range resp.Endpoints {
+			if got == endpoint {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("root endpoint list missing %q; got %v", endpoint, resp.Endpoints)
+		}
+	}
+}
+
 func TestAmpProviderModelRoutes(t *testing.T) {
 	testCases := []struct {
 		name         string
