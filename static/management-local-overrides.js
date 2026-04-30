@@ -1,6 +1,12 @@
 (function () {
   "use strict";
 
+  try {
+    window.localStorage.setItem("isLoggedIn", "true");
+  } catch (_) {
+    // Ignore storage errors; the management API itself remains keyless.
+  }
+
   var USAGE_HASH = "#/usage";
   var AUTO_CALIBRATION_TITLE = "Automatic Calibration";
 
