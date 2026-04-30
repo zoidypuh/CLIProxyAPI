@@ -205,8 +205,8 @@ nonstream-keepalive-interval: 0
 # while user-agent/package-version/runtime-version seed a software fingerprint that can
 # still upgrade to newer official Claude client versions.
 # claude-header-defaults:
-#   version: "2.1.119"
-#   user-agent: "claude-cli/2.1.119 (external, cli)"
+#   version: "2.1.124"
+#   user-agent: "claude-cli/2.1.124 (external, cli)"
 #   package-version: "0.81.0"
 #   runtime-version: "v24.3.0"
 #   os: "Linux"

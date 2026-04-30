@@ -192,7 +192,7 @@ func TestApplyClaudeHeaders_MatchesCapturedClaudeCliHeaders(t *testing.T) {
 	if got := req.Header.Get("x-api-key"); got != "" {
 		t.Fatalf("x-api-key = %q, want empty for OAuth token", got)
 	}
-	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.119 (external, cli)" {
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.124 (external, cli)" {
 		t.Fatalf("User-Agent = %q, want captured Claude CLI UA", got)
 	}
 	if got := req.Header.Get("X-Stainless-Package-Version"); got != "0.81.0" {

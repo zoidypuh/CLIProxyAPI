@@ -1113,7 +1113,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 		r.Header.Set("X-App", "cli")
 	}
-	// Values below match Claude Code 2.1.119 / @anthropic-ai/sdk 0.81.0.
+	// Values below match the configured Claude Code CLI fingerprint.
 	r.Header.Set("X-Stainless-Retry-Count", "0")
 	r.Header.Set("X-Stainless-Runtime", "node")
 	r.Header.Set("X-Stainless-Lang", "js")

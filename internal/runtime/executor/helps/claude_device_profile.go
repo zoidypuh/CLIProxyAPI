@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.119 (external, cli)"
+	defaultClaudeFingerprintVersion        = "2.1.124"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.124 (external, cli)"
 	defaultClaudeFingerprintPackageVersion = "0.81.0"
 	defaultClaudeFingerprintRuntimeVersion = "v24.3.0"
 	defaultClaudeFingerprintOS             = "Linux"
@@ -375,7 +376,7 @@ func DefaultClaudeVersion(cfg *config.Config) string {
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
 	}
-	return "2.1.119"
+	return defaultClaudeFingerprintVersion
 }
 
 func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
