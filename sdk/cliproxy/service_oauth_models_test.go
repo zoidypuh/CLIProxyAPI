@@ -20,7 +20,7 @@ func TestRegisterModelsForAuth_CodexOAuthPlanTypesExposeGPT55(t *testing.T) {
 		{name: "team", planType: "team", wantModel: true},
 		{name: "business", planType: "business", wantModel: true},
 		{name: "go", planType: "go", wantModel: true},
-		{name: "free", planType: "free", wantModel: false},
+		{name: "free", planType: "free", wantModel: true},
 	}
 
 	for _, tt := range tests {

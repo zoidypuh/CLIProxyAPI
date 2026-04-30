@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -245,7 +246,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:    wd,
 		wsRoutes:       make(map[string]struct{}),
 	}
-	s.handlers.UsageLimitWarning = s.usageLimitWarning
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
@@ -258,6 +258,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	if optionState.localPassword != "" {
+		s.mgmt.SetLocalPassword(optionState.localPassword)
+	}
 	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
 	if optionState.postAuthHook != nil {
@@ -491,15 +494,6 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
-		mgmt.GET("/usage/v2", s.mgmt.GetUsageStatisticsV2)
-		mgmt.GET("/usage/percent-calibration", s.mgmt.GetUsagePercentCalibration)
-		mgmt.GET("/usage/percent-calibration/automatic", s.mgmt.GetUsagePercentCalibrationAutomatic)
-		mgmt.POST("/usage/percent-calibration/automatic/start", s.mgmt.StartUsagePercentCalibrationAutomatic)
-		mgmt.POST("/usage/percent-calibration/automatic/stop", s.mgmt.StopUsagePercentCalibrationAutomatic)
-		mgmt.POST("/usage/percent-calibration/start", s.mgmt.StartUsagePercentCalibration)
-		mgmt.POST("/usage/percent-calibration/stop", s.mgmt.StopUsagePercentCalibration)
-		mgmt.DELETE("/usage/percent-calibration/active", s.mgmt.DeleteUsagePercentCalibrationActive)
-		mgmt.DELETE("/usage/percent-calibration", s.mgmt.DeleteUsagePercentCalibration)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)

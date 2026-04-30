@@ -219,20 +219,7 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
-	selectedCallback := selectedAuthIDCallbackFromContext(ctx)
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
-		ginCallback := func(authID string) {
-			ginCtx.Set("CLIPROXY_SELECTED_AUTH_ID", strings.TrimSpace(authID))
-		}
-		if selectedCallback != nil {
-			meta[coreexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
-				ginCallback(authID)
-				selectedCallback(authID)
-			}
-		} else {
-			meta[coreexecutor.SelectedAuthCallbackMetadataKey] = ginCallback
-		}
-	} else if selectedCallback != nil {
+	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
@@ -315,10 +302,6 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
-
-	// UsageLimitWarning optionally returns a user-facing warning to append to
-	// successful model responses.
-	UsageLimitWarning func(c *gin.Context, handlerType string, modelName string, responsePayload []byte) string
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -92,9 +91,6 @@ type modelStats struct {
 type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
 	LatencyMs int64      `json:"latency_ms"`
-	App       string     `json:"app,omitempty"`
-	Provider  string     `json:"provider,omitempty"`
-	AuthID    string     `json:"auth_id,omitempty"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
@@ -204,9 +200,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
-		App:       internalconfig.NormalizeRoutingAppName(record.App),
-		Provider:  strings.TrimSpace(record.Provider),
-		AuthID:    strings.TrimSpace(record.AuthID),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,

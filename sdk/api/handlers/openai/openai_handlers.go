@@ -438,9 +438,6 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	if h.UsageLimitWarning != nil {
-		resp = appendUsageWarningToOpenAIResponse(resp, h.UsageLimitWarning(c, h.HandlerType(), modelName, resp))
-	}
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
 }
@@ -515,12 +512,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			flusher.Flush()
 
 			// Continue streaming the rest
-			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, func() []byte {
-				if h.UsageLimitWarning == nil {
-					return nil
-				}
-				return buildChatCompletionUsageWarningChunk(modelName, h.UsageLimitWarning(c, h.HandlerType(), modelName, nil))
-			})
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
 	}
@@ -551,9 +543,6 @@ func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context,
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	completionsResp := convertChatCompletionsResponseToCompletions(resp)
-	if h.UsageLimitWarning != nil {
-		completionsResp = appendUsageWarningToOpenAIResponse(completionsResp, h.UsageLimitWarning(c, h.HandlerType(), modelName, completionsResp))
-	}
 	_, _ = c.Writer.Write(completionsResp)
 	cliCancel()
 }
@@ -663,17 +652,12 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			h.handleStreamResult(c, flusher, func(err error) {
 				stop()
 				cliCancel(err)
-			}, convertedChan, errChan, func() []byte {
-				if h.UsageLimitWarning == nil {
-					return nil
-				}
-				return buildCompletionUsageWarningChunk(modelName, h.UsageLimitWarning(c, h.HandlerType(), modelName, nil))
-			})
+			}, convertedChan, errChan)
 			return
 		}
 	}
 }
-func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, usageWarningChunk func() []byte) {
+func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
@@ -694,11 +678,6 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
 		},
 		WriteDone: func() {
-			if usageWarningChunk != nil {
-				if chunk := usageWarningChunk(); len(chunk) > 0 {
-					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
-				}
-			}
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 		},
 	})

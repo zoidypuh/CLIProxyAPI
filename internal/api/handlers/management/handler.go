@@ -3,9 +3,12 @@
 package management
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type attemptInfo struct {
@@ -31,29 +35,35 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg            *config.Config
-	configFilePath string
-	mu             sync.Mutex
-	attemptsMu     sync.Mutex
-	failedAttempts map[string]*attemptInfo // keyed by client IP
-	authManager    *coreauth.Manager
-	usageStats     *usage.RequestStatistics
-	tokenStore     coreauth.Store
-	localPassword  string
-	logDir         string
-	postAuthHook   coreauth.PostAuthHook
+	cfg                 *config.Config
+	configFilePath      string
+	mu                  sync.Mutex
+	attemptsMu          sync.Mutex
+	failedAttempts      map[string]*attemptInfo // keyed by client IP
+	authManager         *coreauth.Manager
+	usageStats          *usage.RequestStatistics
+	tokenStore          coreauth.Store
+	localPassword       string
+	allowRemoteOverride bool
+	envSecret           string
+	logDir              string
+	postAuthHook        coreauth.PostAuthHook
 }
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
+	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
+	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:            cfg,
-		configFilePath: configFilePath,
-		failedAttempts: make(map[string]*attemptInfo),
-		authManager:    manager,
-		usageStats:     usage.GetRequestStatistics(),
-		tokenStore:     sdkAuth.GetTokenStore(),
+		cfg:                 cfg,
+		configFilePath:      configFilePath,
+		failedAttempts:      make(map[string]*attemptInfo),
+		authManager:         manager,
+		usageStats:          usage.GetRequestStatistics(),
+		tokenStore:          sdkAuth.GetTokenStore(),
+		allowRemoteOverride: envSecret != "",
+		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
 	return h
@@ -116,6 +126,9 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+// SetLocalPassword configures the runtime-local password accepted for localhost requests.
+func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
@@ -188,6 +201,104 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// AuthenticateManagementKey verifies the provided management key for non-HTTP callers.
+func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
+	const maxFailures = 5
+	const banDuration = 30 * time.Minute
+
+	if h == nil {
+		return false, http.StatusForbidden, "remote management disabled"
+	}
+
+	cfg := h.cfg
+	var (
+		allowRemote bool
+		secretHash  string
+	)
+	if cfg != nil {
+		allowRemote = cfg.RemoteManagement.AllowRemote
+		secretHash = cfg.RemoteManagement.SecretKey
+	}
+	if h.allowRemoteOverride {
+		allowRemote = true
+	}
+	envSecret := h.envSecret
+
+	now := time.Now()
+	h.attemptsMu.Lock()
+	ai := h.failedAttempts[clientIP]
+	if ai != nil && !ai.blockedUntil.IsZero() {
+		if now.Before(ai.blockedUntil) {
+			remaining := ai.blockedUntil.Sub(now).Round(time.Second)
+			h.attemptsMu.Unlock()
+			return false, http.StatusForbidden, fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)
+		}
+		ai.blockedUntil = time.Time{}
+		ai.count = 0
+	}
+	h.attemptsMu.Unlock()
+
+	if !localClient && !allowRemote {
+		return false, http.StatusForbidden, "remote management disabled"
+	}
+
+	fail := func() {
+		h.attemptsMu.Lock()
+		aip := h.failedAttempts[clientIP]
+		if aip == nil {
+			aip = &attemptInfo{}
+			h.failedAttempts[clientIP] = aip
+		}
+		aip.count++
+		aip.lastActivity = time.Now()
+		if aip.count >= maxFailures {
+			aip.blockedUntil = time.Now().Add(banDuration)
+			aip.count = 0
+		}
+		h.attemptsMu.Unlock()
+	}
+
+	reset := func() {
+		h.attemptsMu.Lock()
+		if ai := h.failedAttempts[clientIP]; ai != nil {
+			ai.count = 0
+			ai.blockedUntil = time.Time{}
+		}
+		h.attemptsMu.Unlock()
+	}
+
+	if secretHash == "" && envSecret == "" && h.localPassword == "" {
+		return false, http.StatusForbidden, "remote management key not set"
+	}
+
+	if provided == "" {
+		fail()
+		return false, http.StatusUnauthorized, "missing management key"
+	}
+
+	if localClient {
+		if lp := h.localPassword; lp != "" {
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
+				reset()
+				return true, 0, ""
+			}
+		}
+	}
+
+	if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {
+		reset()
+		return true, 0, ""
+	}
+
+	if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+		fail()
+		return false, http.StatusUnauthorized, "invalid management key"
+	}
+
+	reset()
+	return true, 0, ""
 }
 
 // persist saves the current in-memory config to disk.
