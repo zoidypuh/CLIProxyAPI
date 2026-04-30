@@ -25,7 +25,7 @@ is_request_log() {
 }
 
 PRETTY=$(cat <<'PYEOF'
-import hashlib, json, os, re, sys
+import colorsys, hashlib, json, os, re, sys
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -271,20 +271,19 @@ def fmt_duration(value):
         return f"{value:.1f}s"
     return f"{value:.0f}s"
 
-REQUEST_STYLES = [
-    "bright_magenta", "bright_green", "bright_yellow", "bright_blue",
-    "bright_cyan", "bright_red",
-]
-
-def stable_style(name, styles):
-    digest = hashlib.sha1(name.encode("utf-8", "replace")).digest()[0]
-    return styles[digest % len(styles)]
+def stable_style(name):
+    digest = hashlib.sha1(name.encode("utf-8", "replace")).digest()
+    hue = int.from_bytes(digest[:2], "big") / 65535
+    saturation = 0.68 + (digest[2] / 255) * 0.18
+    lightness = 0.62 + (digest[3] / 255) * 0.14
+    red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
 
 def request_color_key(model_name, client_name):
     return f"{model_name or 'unknown'}\0{client_name or 'unknown'}"
 
 def request_color_style(model_name, client_name):
-    return stable_style(request_color_key(model_name, client_name), REQUEST_STYLES)
+    return stable_style(request_color_key(model_name, client_name))
 
 def plain_style_enabled():
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -292,6 +291,14 @@ def plain_style_enabled():
 def ansi(style):
     if not plain_style_enabled():
         return ""
+    if style.startswith("#") and len(style) == 7:
+        try:
+            red = int(style[1:3], 16)
+            green = int(style[3:5], 16)
+            blue = int(style[5:7], 16)
+            return f"\033[38;2;{red};{green};{blue}m"
+        except ValueError:
+            return ""
     codes = {
         "bright_cyan": "96", "bright_magenta": "95", "bright_green": "92",
         "bright_blue": "94", "bright_yellow": "93", "bright_red": "91",
