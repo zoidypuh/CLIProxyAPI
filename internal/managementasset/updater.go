@@ -34,6 +34,8 @@ const (
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
 	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	managementLocalOverridesFile = "management-local-overrides.js"
+	managementLocalOverridesTag  = `<script defer src="/management-local-overrides.js"></script>`
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -339,6 +341,13 @@ func EnsureNoKeyManagementHTML(localPath string) {
 	}
 	for oldValue, newValue := range replacements {
 		patched = strings.ReplaceAll(patched, oldValue, newValue)
+	}
+	if !strings.Contains(patched, managementLocalOverridesFile) {
+		if strings.Contains(patched, "</body>") {
+			patched = strings.Replace(patched, "</body>", "    "+managementLocalOverridesTag+"\n  </body>", 1)
+		} else {
+			patched += "\n" + managementLocalOverridesTag + "\n"
+		}
 	}
 
 	if patched == content {

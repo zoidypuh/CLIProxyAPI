@@ -1,9 +1,12 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -28,10 +31,13 @@ const (
 
 var (
 	claudeCLIVersionPattern = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
+	semanticVersionPattern  = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
 	claudeDeviceProfileCache            = make(map[string]claudeDeviceProfileCacheEntry)
 	claudeDeviceProfileCacheMu          sync.RWMutex
 	claudeDeviceProfileCacheCleanupOnce sync.Once
+	localClaudeVersionOnce              sync.Once
+	localClaudeVersionText              string
 
 	ClaudeDeviceProfileBeforeCandidateStore func(ClaudeDeviceProfile)
 )
@@ -92,6 +98,11 @@ func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Unlock()
 }
 
+func resetLocalClaudeVersionCacheForTest() {
+	localClaudeVersionOnce = sync.Once{}
+	localClaudeVersionText = ""
+}
+
 func MapStainlessOS() string {
 	return mapStainlessOS()
 }
@@ -129,6 +140,76 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		profile.version = version
 		profile.hasVersion = true
 	}
+	profile = upgradeClaudeDeviceProfileFromLocalCLI(profile)
+	return profile
+}
+
+func localClaudeCodeVersion() string {
+	localClaudeVersionOnce.Do(func() {
+		if version := strings.TrimSpace(os.Getenv("CLAUDE_CODE_VERSION")); version != "" {
+			localClaudeVersionText = version
+			return
+		}
+		if strings.HasSuffix(os.Args[0], ".test") {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		out, err := exec.CommandContext(ctx, "claude", "--version").CombinedOutput()
+		if err != nil {
+			return
+		}
+		localClaudeVersionText = semanticVersionPattern.FindString(string(out))
+	})
+	return localClaudeVersionText
+}
+
+func parseClaudeVersionText(versionText string) (claudeCLIVersion, bool) {
+	matches := semanticVersionPattern.FindStringSubmatch(strings.TrimSpace(versionText))
+	if len(matches) != 4 {
+		return claudeCLIVersion{}, false
+	}
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	patch, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	return claudeCLIVersion{major: major, minor: minor, patch: patch}, true
+}
+
+func formatClaudeVersion(version claudeCLIVersion) string {
+	return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+}
+
+func upgradeClaudeDeviceProfileFromLocalCLI(profile ClaudeDeviceProfile) ClaudeDeviceProfile {
+	if profile.UserAgent != "" && !strings.HasPrefix(strings.TrimSpace(profile.UserAgent), "claude-cli/") {
+		return profile
+	}
+	if profile.UserAgent != "" && !profile.hasVersion {
+		return profile
+	}
+
+	version, ok := parseClaudeVersionText(localClaudeCodeVersion())
+	if !ok {
+		return profile
+	}
+	if profile.hasVersion && version.Compare(profile.version) <= 0 {
+		return profile
+	}
+
+	versionText := formatClaudeVersion(version)
+	profile.UserAgent = "claude-cli/" + versionText + " (external, cli)"
+	profile.version = version
+	profile.hasVersion = true
 	return profile
 }
 
@@ -364,17 +445,22 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
-// DefaultClaudeVersion returns the configured Claude CLI version when present,
-// otherwise it falls back to the baseline device profile's parsed User-Agent.
+// DefaultClaudeVersion returns the baseline device profile's parsed User-Agent
+// version, including any startup auto-upgrade from the local Claude CLI.
 func DefaultClaudeVersion(cfg *config.Config) string {
+	profile := defaultClaudeDeviceProfile(cfg)
 	if cfg != nil {
-		if version := strings.TrimSpace(cfg.ClaudeHeaderDefaults.Version); version != "" {
-			return version
+		if configuredVersion := strings.TrimSpace(cfg.ClaudeHeaderDefaults.Version); configuredVersion != "" {
+			profileVersion, profileOK := parseClaudeCLIVersion(profile.UserAgent)
+			configuredSemver, configuredOK := parseClaudeVersionText(configuredVersion)
+			if profileOK && configuredOK && profileVersion.Compare(configuredSemver) > 0 {
+				return formatClaudeVersion(profileVersion)
+			}
+			return configuredVersion
 		}
 	}
-	profile := defaultClaudeDeviceProfile(cfg)
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
-		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+		return formatClaudeVersion(version)
 	}
 	return defaultClaudeFingerprintVersion
 }

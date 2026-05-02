@@ -9,6 +9,8 @@
 
   var USAGE_HASH = "#/usage";
   var AUTO_CALIBRATION_TITLE = "Automatic Calibration";
+  var REQUEST_EVENTS_TITLE = "Request Events";
+  var USAGE_PAGE_TITLE = "Usage Statistics";
 
   function normalizedText(el) {
     return (el && el.textContent || "").replace(/\s+/g, " ").trim();
@@ -51,6 +53,50 @@
     return best;
   }
 
+  function findUsageContainer() {
+    var headings = document.querySelectorAll("h1");
+    for (var i = 0; i < headings.length; i++) {
+      if (normalizedText(headings[i]) === USAGE_PAGE_TITLE) {
+        return (
+          headings[i].closest('[class*="UsagePage-module__container"]') ||
+          headings[i].parentElement
+        );
+      }
+    }
+    return null;
+  }
+
+  function findDirectUsageChild(label) {
+    var labelEl = findLabel(label);
+    var container = findUsageContainer();
+    if (!labelEl || !container) {
+      return null;
+    }
+
+    var node = labelEl;
+    while (node && node.parentElement && node.parentElement !== container) {
+      node = node.parentElement;
+    }
+    return node && node.parentElement === container ? node : null;
+  }
+
+  function moveRequestEventsBelowUsageHeader() {
+    var container = findUsageContainer();
+    var requestEvents = findDirectUsageChild(REQUEST_EVENTS_TITLE);
+    if (!container || !requestEvents) {
+      return;
+    }
+
+    var header = container.querySelector('[class*="UsagePage-module__header"]');
+    if (!header || header.parentElement !== container) {
+      return;
+    }
+
+    if (header.nextElementSibling !== requestEvents) {
+      container.insertBefore(requestEvents, header.nextElementSibling);
+    }
+  }
+
   function adjustUsageDetails() {
     if (window.location.hash !== USAGE_HASH) {
       return;
@@ -61,6 +107,8 @@
     if (automaticCalibration) {
       automaticCalibration.remove();
     }
+
+    moveRequestEventsBelowUsageHeader();
   }
 
   var scheduled = false;
