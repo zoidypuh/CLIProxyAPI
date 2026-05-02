@@ -253,6 +253,43 @@ func TestClaudeExecutorPrepareRequest_AnthropicOAuthUsesBearer(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_AddsOAuthBetaForClaudeCodeClientOAuth(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-oauth-beta",
+		Metadata: map[string]any{"access_token": "sk-ant-oat01-test"},
+	}
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent": []string{"claude-cli/2.1.126 (external, cli)"},
+		"Anthropic-Beta": []string{
+			"claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24",
+		},
+	})
+
+	applyClaudeHeaders(req, auth, "sk-ant-oat01-test", true, nil, cfg)
+
+	beta := req.Header.Get("Anthropic-Beta")
+	for _, want := range []string{
+		"claude-code-20250219",
+		"oauth-2025-04-20",
+		"advanced-tool-use-2025-11-20",
+		"fast-mode-2026-02-01",
+	} {
+		if !strings.Contains(beta, want) {
+			t.Fatalf("Anthropic-Beta missing %q: %q", want, beta)
+		}
+	}
+	if count := strings.Count(beta, "interleaved-thinking-2025-05-14"); count != 1 {
+		t.Fatalf("interleaved-thinking beta count = %d, want 1 in %q", count, beta)
+	}
+}
+
 func TestResolveOutboundClaudeEntrypoint_UsesResolvedDefaultUserAgent(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true

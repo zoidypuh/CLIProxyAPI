@@ -1080,6 +1080,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 	}
+	if isAnthropicBase && isClaudeOAuthToken(apiKey) {
+		baseBetas = mergeClaudeBetas(baseBetas, strings.Split(claudeCodeBetaHeader, ",")...)
+	}
 	if !strings.Contains(baseBetas, "interleaved-thinking") {
 		baseBetas += ",interleaved-thinking-2025-05-14"
 	}
@@ -1089,20 +1092,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Merge extra betas from request body and request flags.
 	if len(extraBetas) > 0 {
-		existingSet := make(map[string]bool)
-		for _, b := range strings.Split(baseBetas, ",") {
-			betaName := strings.TrimSpace(b)
-			if betaName != "" {
-				existingSet[betaName] = true
-			}
-		}
-		for _, beta := range extraBetas {
-			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
-			}
-		}
+		baseBetas = mergeClaudeBetas(baseBetas, extraBetas...)
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
@@ -1138,6 +1128,32 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+}
+
+func mergeClaudeBetas(baseBetas string, betas ...string) string {
+	existingSet := make(map[string]bool)
+	merged := strings.TrimSpace(baseBetas)
+	for _, b := range strings.Split(merged, ",") {
+		betaName := strings.TrimSpace(b)
+		if betaName != "" {
+			existingSet[betaName] = true
+		}
+	}
+	for _, beta := range betas {
+		for _, betaPart := range strings.Split(beta, ",") {
+			betaName := strings.TrimSpace(betaPart)
+			if betaName == "" || existingSet[betaName] {
+				continue
+			}
+			if merged == "" {
+				merged = betaName
+			} else {
+				merged += "," + betaName
+			}
+			existingSet[betaName] = true
+		}
+	}
+	return merged
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
