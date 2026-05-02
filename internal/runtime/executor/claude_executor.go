@@ -262,7 +262,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body = ensureModelMaxTokens(body, baseModel)
-	if oauthToken && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+	if oauthToken && supportsClaudeCodeOAuthDefaults(baseModel) {
 		body = applyClaudeCodeOAuthRequestDefaults(body)
 	}
 
@@ -456,7 +456,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body = ensureModelMaxTokens(body, baseModel)
-	if oauthToken && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+	if oauthToken && supportsClaudeCodeOAuthDefaults(baseModel) {
 		body = applyClaudeCodeOAuthRequestDefaults(body)
 	}
 
@@ -874,6 +874,14 @@ func applyClaudeCodeOAuthRequestDefaults(body []byte) []byte {
 	}
 
 	return body
+}
+
+func supportsClaudeCodeOAuthDefaults(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return true
+	}
+	return !strings.Contains(normalized, "haiku")
 }
 
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
@@ -1983,14 +1991,14 @@ func restoreOriginalSystemMessages(body []byte, original []byte) []byte {
 	}
 
 	if system.Type == gjson.String {
-		combined := append([]string{strings.TrimSpace(system.String())}, systemTexts...)
+		combined := append([]string{strings.TrimSpace(system.String())}, missingSystemTexts(systemTexts, system)...)
 		body, _ = sjson.SetBytes(body, "system", strings.Join(nonEmptyStrings(combined), "\n\n"))
 		return body
 	}
 
 	if system.IsArray() {
 		nextIndex := len(system.Array())
-		for _, text := range systemTexts {
+		for _, text := range missingSystemTexts(systemTexts, system) {
 			body, _ = sjson.SetBytes(body, fmt.Sprintf("system.%d", nextIndex), map[string]string{
 				"type": "text",
 				"text": text,
@@ -1999,6 +2007,25 @@ func restoreOriginalSystemMessages(body []byte, original []byte) []byte {
 		}
 	}
 	return body
+}
+
+func missingSystemTexts(candidates []string, existing gjson.Result) []string {
+	existingTexts := make(map[string]struct{})
+	for _, text := range extractMessageContentText(existing) {
+		if text = strings.TrimSpace(text); text != "" {
+			existingTexts[text] = struct{}{}
+		}
+	}
+
+	missing := make([]string, 0, len(candidates))
+	for _, text := range nonEmptyStrings(candidates) {
+		if _, ok := existingTexts[text]; ok {
+			continue
+		}
+		existingTexts[text] = struct{}{}
+		missing = append(missing, text)
+	}
+	return missing
 }
 
 func extractOriginalSystemTexts(original []byte) []string {
@@ -2299,8 +2326,8 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		return payload
 	}
 
-	// Skip system instructions for claude-3-5-haiku models
-	if !strings.HasPrefix(model, "claude-3-5-haiku") {
+	// Haiku rejects the Claude Code adaptive/context defaults used with OAuth cloaking.
+	if supportsClaudeCodeOAuthDefaults(model) {
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := resolveOutboundClaudeEntrypoint(ctx, cfg, auth, apiKey)
 		workload := getWorkloadFromContext(ctx)

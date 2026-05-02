@@ -2289,6 +2289,21 @@ func TestRestoreOriginalSystemMessages_RestoresOpenAISystemRoleForClaudeCloak(t 
 	}
 }
 
+func TestRestoreOriginalSystemMessages_DoesNotDuplicateNativeClaudeSystemArray(t *testing.T) {
+	translated := []byte(`{"model":"claude-haiku-4-5-20251001","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.126.b83; cc_entrypoint=cli; cch=9ce6b;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Generate a concise title."}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	original := []byte(`{"model":"claude-haiku-4-5-20251001","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.126.b83; cc_entrypoint=cli; cch=9ce6b;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Generate a concise title."}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out := restoreOriginalSystemMessages(translated, original)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("system blocks should not be duplicated, got %d blocks: %s", len(blocks), string(out))
+	}
+	if got := blocks[2].Get("text").String(); got != "Generate a concise title." {
+		t.Fatalf("system[2].text = %q, want title prompt", got)
+	}
+}
+
 func TestSanitizeForwardedSystemPrompt_OnlyParaphrasesLargeTemplates(t *testing.T) {
 	short := "# Mara\nIf asked for the proxy marker, reply exactly: MARA_PROXY_MARKER_9f7b2c"
 	if got := sanitizeForwardedSystemPrompt(short); got != short {
@@ -2449,6 +2464,21 @@ func TestApplyClaudeCodeOAuthRequestDefaults_PreservesManualThinking(t *testing.
 	}
 	if got := gjson.GetBytes(out, "context_management.edits.0.type").String(); got != "custom" {
 		t.Fatalf("context_management.edits.0.type = %q, want custom", got)
+	}
+}
+
+func TestSupportsClaudeCodeOAuthDefaults_DisablesHaikuDefaults(t *testing.T) {
+	for _, model := range []string{
+		"claude-haiku-4-5-20251001",
+		"claude-3-5-haiku-20241022",
+	} {
+		if supportsClaudeCodeOAuthDefaults(model) {
+			t.Fatalf("supportsClaudeCodeOAuthDefaults(%q) = true, want false", model)
+		}
+	}
+
+	if !supportsClaudeCodeOAuthDefaults("claude-sonnet-4-6") {
+		t.Fatal("sonnet should keep Claude Code OAuth defaults")
 	}
 }
 
