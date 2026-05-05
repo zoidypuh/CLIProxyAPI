@@ -2177,6 +2177,14 @@ func sanitizeForwardedSystemPrompt(text string) string {
 	if !looksLikeLargeAgentSystemTemplate(trimmed) {
 		return trimmed
 	}
+	neutral := neutralForwardedSystemPrompt()
+	if soul := extractForwardedSoulPrompt(trimmed); soul != "" {
+		return soul + "\n\n" + neutral
+	}
+	return neutral
+}
+
+func neutralForwardedSystemPrompt() string {
 	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
 Keep responses concise and focused on the user's request.
 Prefer acting on the user's task over describing product-specific workflows.`)
@@ -2204,6 +2212,32 @@ func looksLikeLargeAgentSystemTemplate(text string) bool {
 		}
 	}
 	return markers >= 3
+}
+
+func extractForwardedSoulPrompt(text string) string {
+	if !strings.Contains(strings.ToLower(text), "soul.md") {
+		return ""
+	}
+
+	end := len(text)
+	for _, marker := range []string{
+		"\n\nIf the user asks about configuring",
+		"\n\nYou have persistent memory",
+		"\n\n════════",
+		"\n\n# Honcho Memory",
+		"\n\n## Skills",
+		"\n\n<available_skills>",
+	} {
+		if idx := strings.Index(text, marker); idx > 0 && idx < end {
+			end = idx
+		}
+	}
+
+	soul := strings.TrimSpace(text[:end])
+	if soul == "" {
+		return ""
+	}
+	return soul
 }
 
 // buildTextBlock constructs a JSON text block object with proper escaping.

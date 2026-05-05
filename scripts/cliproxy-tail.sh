@@ -9,7 +9,7 @@ import colorsys
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 try:
     from rich.console import Console
+    from rich.live import Live
     from rich.text import Text
 except ModuleNotFoundError:
     print("ERROR: rich is required. Install it with: python3 -m pip install --user rich", file=sys.stderr)
@@ -36,6 +37,7 @@ SECTION_RE = re.compile(r"^=== ([A-Z0-9 ]+) ===\s*$", re.M)
 REQUEST_LOG_RE = re.compile(r"^(v1|claude|gemini|codex|openai|anthropic)-")
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+DISPLAY_TZ = timezone(timedelta(hours=-3), "GMT-3")
 
 
 @dataclass
@@ -67,6 +69,16 @@ class RequestSummary:
     @property
     def group_key(self) -> tuple[str, str]:
         return (self.model or "unknown", self.client or "unknown")
+
+
+@dataclass
+class ActiveRequest:
+    path: Path
+    first_seen_monotonic: float
+    last_size: int = -1
+    stable_checks: int = 0
+    summary: RequestSummary | None = None
+    announced: bool = False
 
 
 def env_int(name: str, default: int) -> int:
@@ -329,6 +341,12 @@ def parse_datetime(value: str) -> datetime | None:
         return None
 
 
+def display_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(DISPLAY_TZ)
+
+
 def response_duration_seconds(obj: Any) -> float | None:
     if not isinstance(obj, dict):
         return None
@@ -453,8 +471,8 @@ def parse_log(path: Path) -> RequestSummary | None:
     ts_match = re.search(r"Timestamp:\s*([0-9T:\-\.\+Z]+)", info)
     start_dt = parse_datetime(ts_match.group(1)) if ts_match else None
     if start_dt is None:
-        start_dt = datetime.now()
-    stamp = start_dt.strftime("%H:%M:%S")
+        start_dt = datetime.now(timezone.utc)
+    stamp = display_datetime(start_dt).strftime("%H:%M:%S")
 
     method_match = re.search(r"Method:\s*(\S+)", info)
     method = method_match.group(1) if method_match else ""
@@ -624,14 +642,14 @@ def format_reset_time(value: Any) -> str:
         if numeric > 1_000_000_000_000:
             numeric = numeric / 1000
         try:
-            return datetime.fromtimestamp(numeric).strftime("%m-%d %H:%M")
+            return datetime.fromtimestamp(numeric, tz=DISPLAY_TZ).strftime("%m-%d %H:%M")
         except Exception:
             return ""
 
     if isinstance(value, str):
         parsed = parse_datetime(value)
         if parsed is not None:
-            return parsed.astimezone().strftime("%m-%d %H:%M")
+            return display_datetime(parsed).strftime("%m-%d %H:%M")
 
     return ""
 
@@ -640,7 +658,7 @@ def fallback_reset_time(seconds: int | float | None) -> str:
     if seconds is None or seconds <= 0:
         return ""
     try:
-        return datetime.fromtimestamp(time.time() + float(seconds)).strftime("%m-%d %H:%M")
+        return datetime.fromtimestamp(time.time() + float(seconds), tz=DISPLAY_TZ).strftime("%m-%d %H:%M")
     except Exception:
         return ""
 
@@ -899,6 +917,25 @@ class GroupedRenderer:
         append_kv(text, "tokens/s", fmt_rate(summary.tokens_per_second), f"bold {style}")
         return text
 
+    def received_line(self, summary: RequestSummary) -> Text:
+        style = stable_style("\0".join(summary.group_key))
+        text = Text("◇ HIT  ", style="bold bright_white")
+        text.append(summary.stamp, style=f"bold {style}")
+        text.append("  ")
+        text.append(summary.model or "unknown", style=f"bold {style}")
+        append_kv(text, "client", summary.client or "unknown", style)
+        if summary.endpoint:
+            text.append("  ")
+            if summary.method:
+                text.append(summary.method, style=f"bold {style}")
+                text.append(" ")
+            text.append(summary.endpoint, style=style)
+        return text
+
+    def render_received(self, summary: RequestSummary) -> None:
+        self.separate_from_request_group(blank=False)
+        self.console.print(self.received_line(summary), soft_wrap=True)
+
     def usage_line(self, upstream: str, usage: dict[str, Any] | None, error: str | None = None) -> Text:
         text = Text("◇ USAGE", style="bold bright_white")
         text.append("  ")
@@ -1009,6 +1046,73 @@ def wait_for_stable_file(path: Path) -> None:
         time.sleep(0.3)
 
 
+def log_has_response(path: Path) -> bool:
+    try:
+        text = path.read_text(errors="replace")
+    except FileNotFoundError:
+        return False
+    response_text = section(text, "RESPONSE", last=True)
+    api_response_text = section(text, "API RESPONSE 1", last=True)
+    if re.search(r"\bStatus:\s*\d+", response_text or api_response_text):
+        return True
+    return bool(response_text.strip() or api_response_text.strip())
+
+
+def refresh_active_request(active: ActiveRequest) -> None:
+    try:
+        current_size = active.path.stat().st_size
+    except FileNotFoundError:
+        return
+
+    if current_size == active.last_size:
+        active.stable_checks += 1
+    else:
+        active.last_size = current_size
+        active.stable_checks = 0
+
+    summary = parse_log(active.path)
+    if summary is not None:
+        active.summary = summary
+
+
+def active_request_state(active: ActiveRequest) -> str:
+    if log_has_response(active.path):
+        return "finishing"
+    if active.summary and active.summary.endpoint:
+        return "processing"
+    return "opening"
+
+
+def active_requests_text(active_requests: list[ActiveRequest]) -> Text:
+    text = Text()
+    if not active_requests:
+        return text
+
+    label = "request" if len(active_requests) == 1 else "requests"
+    text.append(f"◇ ACTIVE {len(active_requests)} {label}", style="bold bright_white")
+    now = time.monotonic()
+    for active in sorted(active_requests, key=lambda item: item.first_seen_monotonic):
+        summary = active.summary
+        style = stable_style("\0".join(summary.group_key)) if summary else "bright_cyan"
+        elapsed = now - active.first_seen_monotonic
+        text.append("\n")
+        text.append("  ")
+        text.append(f"{fmt_duration(elapsed)}", style=f"bold {style}")
+        text.append("  ")
+        text.append(active_request_state(active), style=style)
+        if summary is not None:
+            text.append("  ")
+            text.append(summary.model or "unknown", style=f"bold {style}")
+            append_kv(text, "client", summary.client or "unknown", style)
+            if summary.endpoint:
+                text.append("  ")
+                if summary.method:
+                    text.append(summary.method, style=f"bold {style}")
+                    text.append(" ")
+                text.append(summary.endpoint, style=style)
+    return text
+
+
 class PollingWatcher:
     def __init__(self, log_dir: Path, poll_interval: float) -> None:
         self.log_dir = log_dir
@@ -1104,8 +1208,11 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
     renderer = GroupedRenderer(console)
     watcher = InotifyWatcher.create(log_dir) or PollingWatcher(log_dir, args.poll_interval)
     using_inotify = isinstance(watcher, InotifyWatcher)
+    active_requests: dict[str, ActiveRequest] = {}
+    rendered_names: set[str] = set()
 
     console.print(f"Watching [bold]{log_dir}[/] for new request logs... (Ctrl-C to stop)", highlight=False)
+    console.print("Display timezone: GMT-3", style="dim")
     if not using_inotify:
         console.print("inotify unavailable; polling for new files.", style="dim")
     if args.usage_interval > 0:
@@ -1113,19 +1220,41 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
 
     next_usage = time.monotonic() + args.usage_interval if args.usage_interval > 0 else None
     try:
-        while True:
-            timeout = args.poll_interval
-            if next_usage is not None:
-                timeout = min(timeout, max(0.0, next_usage - time.monotonic()))
-            for path in watcher.read(timeout):
-                if not is_request_log(path.name):
-                    continue
-                wait_for_stable_file(path)
-                render_file(renderer, path)
+        with Live(Text(), console=console, auto_refresh=False, transient=True) as live:
+            while True:
+                timeout = args.poll_interval
+                if next_usage is not None:
+                    timeout = min(timeout, max(0.0, next_usage - time.monotonic()))
+                for path in watcher.read(timeout):
+                    if not is_request_log(path.name) or path.name in rendered_names:
+                        continue
+                    active_requests.setdefault(
+                        path.name,
+                        ActiveRequest(path=path, first_seen_monotonic=time.monotonic()),
+                    )
 
-            if next_usage is not None and time.monotonic() >= next_usage:
-                renderer.render_usage_block(fetch_usage_snapshots(args))
-                next_usage = time.monotonic() + args.usage_interval
+                completed: list[ActiveRequest] = []
+                for active in list(active_requests.values()):
+                    refresh_active_request(active)
+                    if not active.announced and active.summary is not None:
+                        active.announced = True
+                        renderer.render_received(active.summary)
+                    if active.stable_checks >= 1 and log_has_response(active.path):
+                        completed.append(active)
+
+                for active in completed:
+                    active_requests.pop(active.path.name, None)
+                    rendered_names.add(active.path.name)
+
+                live.update(active_requests_text(list(active_requests.values())), refresh=True)
+
+                for active in completed:
+                    render_file(renderer, active.path)
+
+                if next_usage is not None and time.monotonic() >= next_usage:
+                    live.update(Text(), refresh=True)
+                    renderer.render_usage_block(fetch_usage_snapshots(args))
+                    next_usage = time.monotonic() + args.usage_interval
     except KeyboardInterrupt:
         console.print()
     finally:

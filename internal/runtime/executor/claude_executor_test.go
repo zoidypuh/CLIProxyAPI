@@ -2316,6 +2316,33 @@ func TestSanitizeForwardedSystemPrompt_OnlyParaphrasesLargeTemplates(t *testing.
 	}
 }
 
+func TestSanitizeForwardedSystemPrompt_PreservesSoulFromLargeTemplates(t *testing.T) {
+	largeSoulTemplate := strings.Join([]string{
+		"# CLAUDE",
+		"SOUL.md - Core Personality",
+		"If asked who you are, answer as Claude with the dry persona.",
+		"",
+		"You have persistent memory across sessions. This should be trimmed.",
+		"<available_skills>",
+		strings.Repeat("x", 12000),
+	}, "\n")
+
+	got := sanitizeForwardedSystemPrompt(largeSoulTemplate)
+
+	if !strings.Contains(got, "SOUL.md - Core Personality") {
+		t.Fatalf("SOUL block should be preserved, got %q", got)
+	}
+	if !strings.Contains(got, "answer as Claude with the dry persona") {
+		t.Fatalf("persona instructions should be preserved, got %q", got)
+	}
+	if strings.Contains(got, "You have persistent memory") || strings.Contains(got, "<available_skills>") {
+		t.Fatalf("large non-SOUL scaffolding should still be trimmed, got %q", got)
+	}
+	if !strings.Contains(got, "Use the available tools when needed") {
+		t.Fatalf("neutral tool reminder should still be appended, got %q", got)
+	}
+}
+
 func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
