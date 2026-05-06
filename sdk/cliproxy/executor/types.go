@@ -14,6 +14,10 @@ const RequestedModelMetadataKey = "requested_model"
 // It is optional and may be absent for non-HTTP executions.
 const RequestPathMetadataKey = "request_path"
 
+// RequestSessionIDMetadataKey stores a client-supplied session identifier for
+// internal routing and usage filtering. It must not be forwarded upstream.
+const RequestSessionIDMetadataKey = "request_session_id"
+
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 

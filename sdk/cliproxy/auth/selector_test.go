@@ -776,6 +776,33 @@ func TestExtractSessionID_Headers(t *testing.T) {
 	}
 }
 
+func TestExtractSessionID_SanitizedSessionIDMetadata(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{
+		cliproxyexecutor.RequestSessionIDMetadataKey: "hermes-session-123",
+	}
+
+	got := ExtractSessionID(nil, nil, metadata)
+	want := "header:hermes-session-123"
+	if got != want {
+		t.Errorf("ExtractSessionID() with metadata = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSessionID_SessionIDHeader(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("Session-Id", "my-hyphen-session")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "header:my-hyphen-session"
+	if got != want {
+		t.Errorf("ExtractSessionID() with Session-Id = %q, want %q", got, want)
+	}
+}
+
 func TestExtractSessionID_CodexSessionIDHeader(t *testing.T) {
 	t.Parallel()
 

@@ -145,3 +145,22 @@ func TestNewUsageReporterUsesRequestedModelMetadata(t *testing.T) {
 		t.Fatalf("record.Model = %q, want %q", record.Model, "codex-hermes")
 	}
 }
+
+func TestNewUsageReporterCapturesSanitizedSessionIDMetadata(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"codex-hermes",
+		nil,
+		cliproxyexecutor.Options{
+			Metadata: map[string]any{
+				cliproxyexecutor.RequestSessionIDMetadataKey: "hermes-session-123",
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "hermes-session-123" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
+	}
+}

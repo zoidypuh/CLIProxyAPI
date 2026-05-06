@@ -199,9 +199,11 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Only include it if the client explicitly provides it.
 	key := ""
 	requestPath := ""
+	requestSessionID := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			requestSessionID = requestSessionIDFromHeaders(ginCtx.Request.Header)
 			requestPath = strings.TrimSpace(ginCtx.FullPath())
 			if requestPath == "" && ginCtx.Request.URL != nil {
 				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
@@ -215,6 +217,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if requestPath != "" {
 		meta[coreexecutor.RequestPathMetadataKey] = requestPath
+	}
+	if requestSessionID != "" {
+		meta[coreexecutor.RequestSessionIDMetadataKey] = requestSessionID
 	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
@@ -239,9 +244,31 @@ func headersFromContext(ctx context.Context) http.Header {
 		return nil
 	}
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return ginCtx.Request.Header.Clone()
+		headers := ginCtx.Request.Header.Clone()
+		removeInternalSessionHeaders(headers)
+		return headers
 	}
 	return nil
+}
+
+func requestSessionIDFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	for _, name := range []string{"Session-Id", "X-Session-ID"} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func removeInternalSessionHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	headers.Del("Session-Id")
+	headers.Del("X-Session-ID")
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {

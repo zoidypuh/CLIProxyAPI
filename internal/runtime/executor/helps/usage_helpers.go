@@ -24,6 +24,7 @@ type UsageReporter struct {
 	authType    string
 	apiKey      string
 	source      string
+	sessionID   string
 	requestedAt time.Time
 	once        sync.Once
 }
@@ -34,6 +35,10 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	if len(opts) > 0 {
 		usageModel = PayloadRequestedModel(opts[0], usageModel)
 	}
+	sessionID := ""
+	if len(opts) > 0 {
+		sessionID = UsageSessionID(opts[0])
+	}
 	reporter := &UsageReporter{
 		provider:    provider,
 		model:       usageModel,
@@ -41,6 +46,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
+		sessionID:   sessionID,
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -149,11 +155,28 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:      r.authID,
 		AuthIndex:   r.authIndex,
 		AuthType:    r.authType,
+		SessionID:   r.sessionID,
 		RequestedAt: r.requestedAt,
 		Latency:     r.latency(),
 		Failed:      failed,
 		Detail:      detail,
 	}
+}
+
+func UsageSessionID(opts cliproxyexecutor.Options) string {
+	if opts.Metadata != nil {
+		if value := strings.TrimSpace(fmt.Sprint(opts.Metadata[cliproxyexecutor.RequestSessionIDMetadataKey])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	if opts.Headers != nil {
+		for _, name := range []string{"Session-Id", "X-Session-ID"} {
+			if value := strings.TrimSpace(opts.Headers.Get(name)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func (r *UsageReporter) latency() time.Duration {
