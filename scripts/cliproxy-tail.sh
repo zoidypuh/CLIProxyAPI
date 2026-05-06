@@ -53,6 +53,8 @@ class TokenStats:
 class RequestSummary:
     path: Path
     stamp: str
+    completed_at: datetime | None
+    completed_stamp: str
     model: str
     client: str
     method: str
@@ -503,10 +505,18 @@ def parse_log(path: Path) -> RequestSummary | None:
 
     resp_ts_match = re.search(r"Timestamp:\s*([0-9T:\-\.\+Z]+)", api_response_text or response_text)
     duration = None
+    completed_at = None
     if resp_ts_match:
         end_dt = parse_datetime(resp_ts_match.group(1))
         if end_dt is not None:
+            completed_at = end_dt
             duration = max(0.0, (end_dt - start_dt).total_seconds())
+
+    if completed_at is None and status:
+        try:
+            completed_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except FileNotFoundError:
+            completed_at = None
 
     generation_duration = response_duration_seconds(api_response_json) or response_duration_seconds(response_json)
     if generation_duration is not None and (duration is None or generation_duration > duration):
@@ -537,6 +547,8 @@ def parse_log(path: Path) -> RequestSummary | None:
     return RequestSummary(
         path=path,
         stamp=stamp,
+        completed_at=completed_at,
+        completed_stamp=display_datetime(completed_at).strftime("%H:%M:%S") if completed_at else "",
         model=str(model),
         client=client_label(headers),
         method=method,
@@ -894,6 +906,7 @@ class GroupedRenderer:
         text.append(summary.stamp, style=f"bold {style}")
         append_kv(text, "status", summary.status, status_style(summary.status))
         append_kv(text, "duration", fmt_duration(summary.duration), f"bold {style}")
+        append_kv(text, "done", summary.completed_stamp, style)
         append_kv(text, "finish", summary.finish, style)
         return text
 
@@ -1206,6 +1219,16 @@ def render_file(renderer: GroupedRenderer, path: Path) -> None:
         renderer.render_request(summary)
 
 
+def completion_sort_key(active: ActiveRequest) -> tuple[float, str]:
+    summary = active.summary
+    if summary is not None and summary.completed_at is not None:
+        return (summary.completed_at.timestamp(), active.path.name)
+    try:
+        return (active.path.stat().st_mtime, active.path.name)
+    except FileNotFoundError:
+        return (time.time(), active.path.name)
+
+
 def live_tail(args: argparse.Namespace, console: Console) -> None:
     log_dir = Path(args.log_dir).expanduser()
     if not log_dir.is_dir():
@@ -1250,6 +1273,7 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
                     if active.stable_checks >= 1 and log_has_response(active.path):
                         completed.append(active)
 
+                completed.sort(key=completion_sort_key)
                 for active in completed:
                     active_requests.pop(active.path.name, None)
                     rendered_names.add(active.path.name)
