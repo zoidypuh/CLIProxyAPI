@@ -49,7 +49,7 @@ var (
 	schedulerConfigPath atomic.Value
 	sfGroup             singleflight.Group
 
-	managementPasswordRequiredCheckPattern = regexp.MustCompile(`if\(![A-Za-z_$][A-Za-z0-9_$]*\.trim\(\)\)\{[A-Za-z_$][A-Za-z0-9_$]*\(t\("login\.error_required"\)\);return\}`)
+	managementPasswordRequiredCheckPattern = regexp.MustCompile("if\\s*\\(\\s*![A-Za-z_$][A-Za-z0-9_$]*\\.trim\\(\\)\\s*\\)\\s*\\{\\s*[A-Za-z_$][A-Za-z0-9_$]*\\s*\\(\\s*[A-Za-z_$][A-Za-z0-9_$]*\\s*\\(\\s*[\"'`]login\\.error_required[\"'`]\\s*\\)\\s*\\)\\s*;\\s*return\\s*\\}")
 )
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
@@ -316,32 +316,7 @@ func EnsureNoKeyManagementHTML(localPath string) {
 	content := string(data)
 	patched := content
 	patched = managementPasswordRequiredCheckPattern.ReplaceAllString(patched, `if(false){return}`)
-	replacements := map[string]string{
-		`if(!b.trim()){J(t("login.error_required"));return}`:                           `if(false&&!b.trim()){J(t("login.error_required"));return}`,
-		`remember_password_label:"Remember password"`:                                  `remember_password_label:"Remember connection"`,
-		`management_key_label:"Management Key:"`:                                       `management_key_label:"Management Access:"`,
-		`management_key_placeholder:"Enter the management key"`:                        `management_key_placeholder:"No password required"`,
-		`error_invalid:"Connection failed, please check address and key"`:              `error_invalid:"Connection failed, please check address"`,
-		`error_unauthorized:"Authentication failed, invalid management key"`:           `error_unauthorized:"Authentication failed"`,
-		`remember_password_label:"记住密码"`:                                               `remember_password_label:"记住连接"`,
-		`management_key_label:"管理密钥:"`:                                                 `management_key_label:"管理访问:"`,
-		`management_key_placeholder:"请输入管理密钥"`:                                         `management_key_placeholder:"无需密码"`,
-		`error_invalid:"连接失败，请检查地址和密钥"`:                                                `error_invalid:"连接失败，请检查地址"`,
-		`error_unauthorized:"认证失败，管理密钥无效"`:                                             `error_unauthorized:"认证失败"`,
-		`remember_password_label:"記住密碼"`:                                               `remember_password_label:"記住連線"`,
-		`management_key_label:"管理金鑰:"`:                                                 `management_key_label:"管理存取:"`,
-		`management_key_placeholder:"請輸入管理金鑰"`:                                         `management_key_placeholder:"無需密碼"`,
-		`error_invalid:"連線失敗，請檢查位址和金鑰"`:                                                `error_invalid:"連線失敗，請檢查位址"`,
-		`error_unauthorized:"驗證失敗，管理金鑰無效"`:                                             `error_unauthorized:"驗證失敗"`,
-		`remember_password_label:"Запомнить пароль"`:                                   `remember_password_label:"Запомнить подключение"`,
-		`management_key_label:"Ключ управления:"`:                                      `management_key_label:"Доступ к управлению:"`,
-		`management_key_placeholder:"Введите ключ управления"`:                         `management_key_placeholder:"Пароль не требуется"`,
-		`error_unauthorized:"Ошибка аутентификации, недействительный ключ управления"`: `error_unauthorized:"Ошибка аутентификации"`,
-		`error_invalid:"Не удалось подключиться, проверьте адрес и ключ"`:              `error_invalid:"Не удалось подключиться, проверьте адрес"`,
-	}
-	for oldValue, newValue := range replacements {
-		patched = strings.ReplaceAll(patched, oldValue, newValue)
-	}
+	patched = replaceManagementLoginText(patched)
 	if !strings.Contains(patched, managementLocalOverridesFile) {
 		if strings.Contains(patched, "</body>") {
 			patched = strings.Replace(patched, "</body>", "    "+managementLocalOverridesTag+"\n  </body>", 1)
@@ -358,6 +333,45 @@ func EnsureNoKeyManagementHTML(localPath string) {
 		return
 	}
 	log.Info("management control panel patched for keyless access")
+}
+
+type managementTextReplacement struct {
+	key     string
+	oldText string
+	newText string
+}
+
+func replaceManagementLoginText(content string) string {
+	replacements := []managementTextReplacement{
+		{key: "remember_password_label", oldText: "Remember password", newText: "Remember connection"},
+		{key: "management_key_label", oldText: "Management Key:", newText: "Management Access:"},
+		{key: "management_key_placeholder", oldText: "Enter the management key", newText: "No password required"},
+		{key: "error_invalid", oldText: "Connection failed, please check address and key", newText: "Connection failed, please check address"},
+		{key: "error_unauthorized", oldText: "Authentication failed, invalid management key", newText: "Authentication failed"},
+		{key: "remember_password_label", oldText: "记住密码", newText: "记住连接"},
+		{key: "management_key_label", oldText: "管理密钥:", newText: "管理访问:"},
+		{key: "management_key_placeholder", oldText: "请输入管理密钥", newText: "无需密码"},
+		{key: "error_invalid", oldText: "连接失败，请检查地址和密钥", newText: "连接失败，请检查地址"},
+		{key: "error_unauthorized", oldText: "认证失败，管理密钥无效", newText: "认证失败"},
+		{key: "remember_password_label", oldText: "記住密碼", newText: "記住連線"},
+		{key: "management_key_label", oldText: "管理金鑰:", newText: "管理存取:"},
+		{key: "management_key_placeholder", oldText: "請輸入管理金鑰", newText: "無需密碼"},
+		{key: "error_invalid", oldText: "連線失敗，請檢查位址和金鑰", newText: "連線失敗，請檢查位址"},
+		{key: "error_unauthorized", oldText: "驗證失敗，管理金鑰無效", newText: "驗證失敗"},
+		{key: "remember_password_label", oldText: "Запомнить пароль", newText: "Запомнить подключение"},
+		{key: "management_key_label", oldText: "Ключ управления:", newText: "Доступ к управлению:"},
+		{key: "management_key_placeholder", oldText: "Введите ключ управления", newText: "Пароль не требуется"},
+		{key: "error_unauthorized", oldText: "Ошибка аутентификации, недействительный ключ управления", newText: "Ошибка аутентификации"},
+		{key: "error_invalid", oldText: "Не удалось подключиться, проверьте адрес и ключ", newText: "Не удалось подключиться, проверьте адрес"},
+	}
+	for _, replacement := range replacements {
+		for _, quote := range []string{`"`, `'`, "`"} {
+			oldValue := replacement.key + ":" + quote + replacement.oldText + quote
+			newValue := replacement.key + ":" + quote + replacement.newText + quote
+			content = strings.ReplaceAll(content, oldValue, newValue)
+		}
+	}
+	return content
 }
 
 func pinnedManagementAsset(localPath string) bool {
