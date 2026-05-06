@@ -1,9 +1,11 @@
 package helps
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -122,5 +124,24 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{CachedTokens: 2}); !ok {
 		t.Fatalf("expected non-zero cached token usage to be recorded")
+	}
+}
+
+func TestNewUsageReporterUsesRequestedModelMetadata(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Metadata: map[string]any{
+				cliproxyexecutor.RequestedModelMetadataKey: "codex-hermes",
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.Model != "codex-hermes" {
+		t.Fatalf("record.Model = %q, want %q", record.Model, "codex-hermes")
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -27,11 +28,15 @@ type UsageReporter struct {
 	once        sync.Once
 }
 
-func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
+func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth, opts ...cliproxyexecutor.Options) *UsageReporter {
 	apiKey := APIKeyFromContext(ctx)
+	usageModel := strings.TrimSpace(model)
+	if len(opts) > 0 {
+		usageModel = PayloadRequestedModel(opts[0], usageModel)
+	}
 	reporter := &UsageReporter{
 		provider:    provider,
-		model:       model,
+		model:       usageModel,
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),

@@ -610,6 +610,10 @@ def fresh_tokens(tokens: TokenStats) -> int | None:
     return max(0, tokens.prompt - tokens.cached)
 
 
+def high_input_no_cache(tokens: TokenStats) -> bool:
+    return tokens.prompt is not None and tokens.prompt > 10_000 and (tokens.cached or 0) < 1_000
+
+
 def clamp_percent(value: float) -> float:
     return max(0.0, min(100.0, value))
 
@@ -908,13 +912,17 @@ class GroupedRenderer:
         tokens = summary.tokens
         if not has_tokens(tokens):
             return None
+        suspicious_cache_miss = high_input_no_cache(tokens)
+        fresh_style = "bold bright_white on red" if suspicious_cache_miss else f"bold {style}"
         text = Text("│  tokens  ", style=style)
-        append_kv(text, "fresh", fmt_num(fresh_tokens(tokens)), f"bold {style}", pad=False)
-        append_kv(text, "cached", fmt_num(tokens.cached) if tokens.cached else None, style)
+        append_kv(text, "fresh", fmt_num(fresh_tokens(tokens)), fresh_style, pad=False)
+        append_kv(text, "cached", fmt_num(tokens.cached) if tokens.cached is not None else None, fresh_style if suspicious_cache_miss else style)
         append_kv(text, "output", fmt_num(tokens.output), f"bold {style}")
         append_kv(text, "reasoning", fmt_num(tokens.reasoning) if tokens.reasoning else None, style)
         append_kv(text, "total", fmt_num(tokens.total), f"bold {style}")
         append_kv(text, "tokens/s", fmt_rate(summary.tokens_per_second), f"bold {style}")
+        if suspicious_cache_miss:
+            text.append("  CACHE-MISS? input>10k cached<1k", style="bold bright_white on red")
         return text
 
     def received_line(self, summary: RequestSummary) -> Text:
