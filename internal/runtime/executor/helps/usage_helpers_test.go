@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -143,6 +144,25 @@ func TestNewUsageReporterUsesRequestedModelMetadata(t *testing.T) {
 	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
 	if record.Model != "codex-hermes" {
 		t.Fatalf("record.Model = %q, want %q", record.Model, "codex-hermes")
+	}
+}
+
+func TestNewUsageReporterCapturesSessionIDHeader(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"codex-hermes",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"hermes-session-123"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "hermes-session-123" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
 	}
 }
 

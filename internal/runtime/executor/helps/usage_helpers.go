@@ -170,7 +170,7 @@ func UsageSessionID(opts cliproxyexecutor.Options) string {
 		}
 	}
 	if opts.Headers != nil {
-		for _, name := range []string{"Session-Id", "X-Session-ID"} {
+		for _, name := range []string{"Session_id", "Session-Id", "X-Session-ID"} {
 			if value := strings.TrimSpace(opts.Headers.Get(name)); value != "" {
 				return value
 			}
