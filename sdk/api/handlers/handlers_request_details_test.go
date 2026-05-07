@@ -1,14 +1,18 @@
 package handlers
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -135,5 +139,82 @@ func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	msg := errMsg.Error.Error()
 	if !strings.Contains(msg, "/v1/images/generations") || !strings.Contains(msg, "/v1/images/edits") {
 		t.Fatalf("unexpected error message: %q", msg)
+	}
+}
+
+type requestedModelCaptureExecutor struct {
+	model          string
+	requestedModel string
+}
+
+func (e *requestedModelCaptureExecutor) Identifier() string { return "codex" }
+
+func (e *requestedModelCaptureExecutor) Execute(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	e.model = req.Model
+	if opts.Metadata != nil {
+		e.requestedModel = strings.TrimSpace(fmt.Sprint(opts.Metadata[coreexecutor.RequestedModelMetadataKey]))
+	}
+	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *requestedModelCaptureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, fmt.Errorf("stream not implemented")
+}
+
+func (e *requestedModelCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *requestedModelCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, fmt.Errorf("count not implemented")
+}
+
+func (e *requestedModelCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("http request not implemented")
+}
+
+func TestExecuteWithAuthManagerUsageMetadataKeepsRequestedAlias(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	authID := "test-requested-model-alias-auth"
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{
+		{ID: "codex-hermes", Created: time.Now().Unix()},
+		{ID: "gpt-5.5", Created: time.Now().Unix()},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(authID)
+	})
+
+	executor := &requestedModelCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"codex": {
+			{Name: "gpt-5.5", Alias: "codex-hermes"},
+		},
+	})
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	_, _, errMsg := handler.ExecuteWithAuthManager(
+		context.Background(),
+		"openai",
+		"codex-hermes",
+		[]byte(`{"model":"codex-hermes"}`),
+		"",
+	)
+	if errMsg != nil {
+		t.Fatalf("ExecuteWithAuthManager() error = %v", errMsg.Error)
+	}
+	if executor.model != "gpt-5.5" {
+		t.Fatalf("executor model = %q, want upstream %q", executor.model, "gpt-5.5")
+	}
+	if executor.requestedModel != "codex-hermes" {
+		t.Fatalf("requested model metadata = %q, want alias %q", executor.requestedModel, "codex-hermes")
 	}
 }

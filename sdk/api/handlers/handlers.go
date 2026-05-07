@@ -542,7 +542,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = usageRequestedModel(modelName, normalizedModel)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -590,7 +590,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = usageRequestedModel(modelName, normalizedModel)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -642,7 +642,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		return nil, nil, errChan
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = usageRequestedModel(modelName, normalizedModel)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -806,6 +806,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func usageRequestedModel(modelName, normalizedModel string) string {
+	if requested := strings.TrimSpace(modelName); requested != "" {
+		return requested
+	}
+	return strings.TrimSpace(normalizedModel)
 }
 
 func validateSSEDataJSON(chunk []byte) error {
