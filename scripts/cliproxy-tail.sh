@@ -44,6 +44,7 @@ KNOWN_MASKED_SESSION_LABELS = {
     "qw...te": "qwen-delegate",
     "qwen...gate": "qwen-delegate",
 }
+HERMES_CACHE_MISS_SESSIONS = {"hermes", "lola"}
 
 
 @dataclass
@@ -728,13 +729,25 @@ def cache_miss_output_path(source: Path) -> Path:
     return source.parent / "cache-miss" / f"{source.name}.txt"
 
 
+def is_hermes_request(summary: RequestSummary) -> bool:
+    session = (summary.session or "").strip().lower()
+    client = (summary.client or "").strip().lower()
+    model = (summary.model or "").strip().lower()
+    return (
+        session in HERMES_CACHE_MISS_SESSIONS
+        or client == "hermes agent"
+        or model == "codex-hermes"
+    )
+
+
 def write_cache_miss(summary: RequestSummary) -> Path | None:
-    if not cache_miss_detected(summary.tokens):
+    if not cache_miss_detected(summary.tokens) or not is_hermes_request(summary):
+        return None
+    if not summary.path.is_file():
         return None
     target = cache_miss_output_path(summary.path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    header, token_line = compact_lines(summary)
-    target.write_text(f"{header}\n{token_line}\n", encoding="utf-8")
+    target.write_bytes(summary.path.read_bytes())
     return target
 
 

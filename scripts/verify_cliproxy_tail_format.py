@@ -269,16 +269,20 @@ def main() -> int:
             raise AssertionError(f"cache-miss line style = {miss_line.style!r}, want red highlight")
         render_file(module, miss_path)
         miss_copy = Path(tmp) / "cache-miss" / "v1-cache-miss.log.txt"
+        if miss_copy.exists():
+            raise AssertionError(f"non-Hermes cache-miss copy should not be written: {miss_copy}")
+
+        hermes_miss_path = Path(tmp) / "v1-cache-miss-hermes.log"
+        hermes_miss_log = sample_log(prompt=12_000, cached=0, output=100, auth="hermes")
+        hermes_miss_path.write_text(hermes_miss_log, encoding="utf-8")
+        render_file(module, hermes_miss_path)
+        miss_copy = Path(tmp) / "cache-miss" / "v1-cache-miss-hermes.log.txt"
         if not miss_copy.exists():
             raise AssertionError(f"cache-miss copy was not written: {miss_copy}")
-        miss_copy_lines = miss_copy.read_text(encoding="utf-8").splitlines()
-        expected_miss_copy = [
-            "05:36:42  mac/qwen3.6-35b-a3b-ud-mlx  session=qwen-delegate",
-            "fresh=12,000  output=100  cached=0  total=12,100  tokens/s=5.6  duration=18s",
-        ]
-        if miss_copy_lines != expected_miss_copy:
+        miss_copy_text = miss_copy.read_text(encoding="utf-8")
+        if miss_copy_text != hermes_miss_log:
             raise AssertionError(
-                f"cache-miss copy mismatch:\nexpected={expected_miss_copy!r}\nactual={miss_copy_lines!r}"
+                f"cache-miss copy mismatch:\nexpected={hermes_miss_log!r}\nactual={miss_copy_text!r}"
             )
 
         websocket_path = Path(tmp) / "v1-responses-websocket-error.log"

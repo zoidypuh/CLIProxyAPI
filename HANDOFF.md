@@ -6,7 +6,8 @@
   - `fresh=<fresh_input_tokens>  output=<output_tokens>  cached=<cached_tokens>  total=<total_tokens>  tokens/s=<tokens_per_second>  duration=<duration>`
 - Added exactly one blank line between completed request entries, not between the two lines inside an entry.
 - Kept session/API-key values raw in this compact log view; examples such as `session=hermes`, `session=honcho`, and `session=qwen-delegate` are not shortened by the tailer.
-- Cache-miss summaries now write a compact two-line copy under a `cache-miss/` subfolder beside the source log.
+- Cache-miss dumps now write only for Hermes-side requests (`session=hermes`, `session=lola`, Hermes client label, or `model=codex-hermes`) under a `cache-miss/` subfolder beside the source log.
+- Cache-miss dumps now copy the complete source request log file instead of writing only the compact two-line summary.
 - Cache-miss definition matches the existing red-highlight logic: prompt/input tokens greater than 10,000 and cached tokens below 1,000.
 - Follow-up correction: older request logs already contain masked short local session labels such as `he...es` and `ho...ho`; the tailer now restores those known local labels to `hermes` / `honcho` / `qwen-delegate` when rendering.
 - Future request logs preserve label-like local bearer values such as `hermes`, `honcho`, `lola`, and `qwen-delegate` while continuing to mask JWTs and obvious secret-key prefixes.
@@ -18,14 +19,14 @@
 ## Changed Files
 - `scripts/cliproxy-tail.sh`
   - Adds blank-line separation between completed request entries while keeping each request to two compact lines.
-  - Centralizes compact line generation so cache-miss files contain the same fields the log view intentionally shows.
-  - Writes cache-miss compact copies to `cache-miss/<original-log-filename>.txt` beside the source request log.
+  - Centralizes compact line generation for display and keeps cache-miss detection aligned with the red-highlight logic.
+  - Writes full-log cache-miss copies to `cache-miss/<original-log-filename>.txt` beside the source request log, limited to Hermes-side requests.
   - Restores known masked local session labels from older logs before printing `session=...`.
   - Polls `/v0/management/usage` with `--management-usage-interval` / `CLIPROXY_MANAGEMENT_USAGE_INTERVAL` so token-bearing completions can be rendered before the finalized request log file is available. Set the interval to `0` to disable this path.
   - Uses request fingerprints to avoid double-printing when the same completion later arrives through the request-log fallback.
 - `scripts/verify_cliproxy_tail_format.py`
   - Verifies no `HIT` marker regressed into the tailer.
-  - Verifies compact two-line request output, one blank line between requests, no old verbose fields, full session/API-key values, masked old local session restoration, management-usage rendering, cache-miss red-highlight logic, cache-miss file writing, and the websocket `/v1/responses` completion fixture.
+  - Verifies compact two-line request output, one blank line between requests, no old verbose fields, full session/API-key values, masked old local session restoration, management-usage rendering, cache-miss red-highlight logic, Hermes-only full-log cache-miss file writing, and the websocket `/v1/responses` completion fixture.
 - `internal/runtime/executor/helps/usage_helpers.go`
   - Keeps existing Gin `apiKey` behavior first.
   - Adds a narrow fallback that publishes short local session labels from request headers into usage records when middleware did not populate `apiKey`.
@@ -43,7 +44,8 @@
 ## Cache-Miss Files
 - Location: `<source-log-directory>/cache-miss/`
 - File name: `<original-log-filename>.txt`
-- Content: the same compact two-line request summary printed by the log view, including the now-unshortened `session=<api_key>` value.
+- Written only for Hermes-side cache misses: `session=hermes`, `session=lola`, Hermes client label, or `model=codex-hermes`.
+- Content: the complete source request log file, including the same request/response material already present in that log view source.
 - Example: `~/.cli-proxy-api/logs/cache-miss/v1-cache-miss.log.txt`
 
 ## Verification
