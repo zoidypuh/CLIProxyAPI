@@ -91,11 +91,19 @@ type modelStats struct {
 type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
 	LatencyMs int64      `json:"latency_ms"`
+	APIKey    string     `json:"api_key,omitempty"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	SessionID string     `json:"session_id,omitempty"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
+}
+
+// RequestEvent is a flattened request detail with its aggregate API key and model.
+type RequestEvent struct {
+	APIKey string        `json:"api_key"`
+	Model  string        `json:"model"`
+	Detail RequestDetail `json:"detail"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -201,6 +209,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
+		APIKey:    strings.TrimSpace(statsKey),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
 		SessionID: strings.TrimSpace(record.SessionID),
@@ -225,6 +234,48 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+}
+
+// RequestEvents returns flattened request events from the snapshot.
+func (snapshot StatisticsSnapshot) RequestEvents() []RequestEvent {
+	return FilterRequestEvents(snapshot, "", "")
+}
+
+// FilterRequestEvents returns flattened request events filtered by model alias and API key.
+func FilterRequestEvents(snapshot StatisticsSnapshot, modelAlias, apiKey string) []RequestEvent {
+	modelAlias = strings.TrimSpace(modelAlias)
+	apiKey = strings.TrimSpace(apiKey)
+	events := make([]RequestEvent, 0)
+	for aggregateAPIKey, apiSnapshot := range snapshot.APIs {
+		aggregateAPIKey = strings.TrimSpace(aggregateAPIKey)
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = strings.TrimSpace(modelName)
+			if modelAlias != "" && modelName != modelAlias {
+				continue
+			}
+			for _, detail := range modelSnapshot.Details {
+				detail.APIKey = firstNonEmpty(detail.APIKey, aggregateAPIKey)
+				if apiKey != "" && detail.APIKey != apiKey {
+					continue
+				}
+				events = append(events, RequestEvent{
+					APIKey: detail.APIKey,
+					Model:  modelName,
+					Detail: detail,
+				})
+			}
+		}
+	}
+	return events
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -252,6 +303,9 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
 			copy(requestDetails, modelStatsValue.Details)
+			for i := range requestDetails {
+				requestDetails[i].APIKey = firstNonEmpty(requestDetails[i].APIKey, apiName)
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
 				TotalTokens:   modelStatsValue.TotalTokens,
@@ -336,6 +390,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				detail.APIKey = firstNonEmpty(detail.APIKey, apiName)
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}

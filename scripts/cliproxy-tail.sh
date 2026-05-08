@@ -38,6 +38,12 @@ REQUEST_LOG_RE = re.compile(r"^(v1|claude|gemini|codex|openai|anthropic)-")
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 DISPLAY_TZ = timezone(timedelta(hours=-3), "GMT-3")
+KNOWN_MASKED_SESSION_LABELS = {
+    "he...es": "hermes",
+    "ho...ho": "honcho",
+    "qw...te": "qwen-delegate",
+    "qwen...gate": "qwen-delegate",
+}
 
 
 @dataclass
@@ -57,6 +63,7 @@ class RequestSummary:
     completed_stamp: str
     model: str
     client: str
+    session: str
     method: str
     endpoint: str
     message_count: int
@@ -70,7 +77,7 @@ class RequestSummary:
 
     @property
     def group_key(self) -> tuple[str, str]:
-        return (self.model or "unknown", self.client or "unknown")
+        return (self.model or "unknown", self.session or self.client or "unknown")
 
 
 @dataclass
@@ -80,7 +87,6 @@ class ActiveRequest:
     last_size: int = -1
     stable_checks: int = 0
     summary: RequestSummary | None = None
-    announced: bool = False
 
 
 def env_int(name: str, default: int) -> int:
@@ -89,6 +95,16 @@ def env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
@@ -115,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--usage-interval",
         type=int,
-        default=env_int("CLIPROXY_USAGE_INTERVAL", 300),
-        help="Seconds between upstream usage snapshots. Use 0 to disable.",
+        default=env_int("CLIPROXY_USAGE_INTERVAL", 0),
+        help="Deprecated; separate upstream usage snapshots are disabled.",
     )
     parser.add_argument(
         "--auth-dir",
@@ -138,6 +154,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Polling interval used when Linux inotify is unavailable.",
+    )
+    parser.add_argument(
+        "--management-usage-interval",
+        type=float,
+        default=env_float("CLIPROXY_MANAGEMENT_USAGE_INTERVAL", 1.0),
+        help="Seconds between /v0/management/usage polls for live completed requests. Use 0 to disable.",
     )
     parser.add_argument(
         "--file",
@@ -196,6 +218,44 @@ def first_json(blob: str) -> dict[str, Any] | list[Any] | None:
         except Exception:
             return None
     return None
+
+
+def websocket_event_json(text: str, event: str) -> dict[str, Any] | None:
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip() != f"Event: {event}":
+            continue
+        for raw in lines[idx + 1 :]:
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            if candidate.startswith(("Timestamp:", "Event:", "===")):
+                break
+            if not candidate.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def websocket_response_json(text: str) -> dict[str, Any] | None:
+    data_lines: list[str] = []
+    in_response = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line == "Event: websocket.response":
+            in_response = True
+            continue
+        if line.startswith("Event: ") or line.startswith("==="):
+            in_response = False
+        if in_response and line.startswith("{"):
+            data_lines.append(f"data: {line}")
+    if not data_lines:
+        return None
+    return parse_sse_json("\n".join(data_lines))
 
 
 def parse_sse_json(blob: str) -> dict[str, Any] | None:
@@ -304,7 +364,7 @@ def client_key(headers: dict[str, str]) -> str:
     raw = raw.strip()
     if raw.lower().startswith("bearer "):
         raw = raw[7:].strip()
-    return raw
+    return KNOWN_MASKED_SESSION_LABELS.get(raw.lower(), raw)
 
 
 def client_label_from_key(key: str) -> str:
@@ -482,15 +542,18 @@ def parse_log(path: Path) -> RequestSummary | None:
     url_match = re.search(r"URL:\s*(\S+)", info)
     endpoint = url_match.group(1) if url_match else path.name
 
-    request_json = first_json(section(text, "REQUEST BODY"))
+    request_json = first_json(section(text, "REQUEST BODY")) or websocket_event_json(text, "websocket.request")
     headers = parse_headers(section(text, "HEADERS"))
     response_text = section(text, "RESPONSE", last=True)
-    api_response_text = section(text, "API RESPONSE 1", last=True)
+    api_response_text = section(text, "API RESPONSE 1", last=True) or section(text, "API RESPONSE", last=True)
+    api_error_response_text = section(text, "API ERROR RESPONSE", last=True)
     response_json = first_json(response_text)
     api_response_json = first_json(api_response_text)
-    parsed_response = response_json if response_json is not None else api_response_json
+    websocket_json = websocket_response_json(text)
+    parsed_response = response_json if response_json is not None else api_response_json or websocket_json
 
-    status_match = re.search(r"\bStatus:\s*(\d+)", response_text or api_response_text)
+    status_source = "\n".join(part for part in (response_text, api_response_text, api_error_response_text) if part)
+    status_match = re.search(r"\b(?:HTTP\s+)?Status:\s*(\d+)", status_source)
     status = status_match.group(1) if status_match else ""
 
     api_request = section(text, "API REQUEST 1")
@@ -544,13 +607,16 @@ def parse_log(path: Path) -> RequestSummary | None:
     if output_tokens is not None and duration and duration > 0:
         tokens_per_second = output_tokens / duration
 
+    raw_client_key = client_key(headers)
+    client = client_label(headers)
     return RequestSummary(
         path=path,
         stamp=stamp,
         completed_at=completed_at,
         completed_stamp=display_datetime(completed_at).strftime("%H:%M:%S") if completed_at else "",
         model=str(model),
-        client=client_label(headers),
+        client=client,
+        session=raw_client_key or client or "unknown",
         method=method,
         endpoint=endpoint,
         message_count=message_count,
@@ -624,6 +690,52 @@ def fresh_tokens(tokens: TokenStats) -> int | None:
 
 def high_input_no_cache(tokens: TokenStats) -> bool:
     return tokens.prompt is not None and tokens.prompt > 10_000 and (tokens.cached or 0) < 1_000
+
+
+def cache_miss_detected(tokens: TokenStats) -> bool:
+    return high_input_no_cache(tokens)
+
+
+def compact_lines(summary: RequestSummary) -> tuple[str, str]:
+    tokens = summary.tokens
+    header = f"{summary.stamp or '-'}  {summary.model or 'unknown'}  session={summary.session or 'unknown'}"
+    values = [
+        ("fresh", fmt_num(fresh_tokens(tokens))),
+        ("output", fmt_num(tokens.output)),
+        ("cached", fmt_num(tokens.cached)),
+        ("total", fmt_num(tokens.total)),
+        ("tokens/s", fmt_rate(summary.tokens_per_second)),
+        ("duration", fmt_duration(summary.duration)),
+    ]
+    return header, "  ".join(f"{label}={value}" for label, value in values)
+
+
+def request_fingerprint(summary: RequestSummary) -> tuple[Any, ...]:
+    tokens = summary.tokens
+    return (
+        summary.stamp or "",
+        summary.model or "unknown",
+        summary.session or summary.client or "unknown",
+        tokens.prompt,
+        tokens.cached,
+        tokens.output,
+        tokens.reasoning,
+        tokens.total,
+    )
+
+
+def cache_miss_output_path(source: Path) -> Path:
+    return source.parent / "cache-miss" / f"{source.name}.txt"
+
+
+def write_cache_miss(summary: RequestSummary) -> Path | None:
+    if not cache_miss_detected(summary.tokens):
+        return None
+    target = cache_miss_output_path(summary.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    header, token_line = compact_lines(summary)
+    target.write_text(f"{header}\n{token_line}\n", encoding="utf-8")
+    return target
 
 
 def clamp_percent(value: float) -> float:
@@ -805,6 +917,142 @@ def claude_auth_candidates(auth_dir: str, auth_file: str) -> list[Path]:
     return sorted(root.glob("claude-*.json"))
 
 
+def management_usage_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/v0/management/usage"
+
+
+def fetch_management_usage(base_url: str) -> dict[str, Any] | None:
+    req = urllib.request.Request(management_usage_url(base_url), headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            body = resp.read()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def detail_tokens(detail: dict[str, Any]) -> TokenStats:
+    tokens_raw = detail.get("tokens")
+    tokens_map = tokens_raw if isinstance(tokens_raw, dict) else {}
+    return TokenStats(
+        prompt=as_int(tokens_map.get("input_tokens")),
+        cached=as_int(tokens_map.get("cached_tokens")),
+        output=as_int(tokens_map.get("output_tokens")),
+        reasoning=as_int(tokens_map.get("reasoning_tokens")),
+        total=as_int(tokens_map.get("total_tokens")),
+    )
+
+
+def usage_event_key(api_key: str, model: str, detail: dict[str, Any]) -> tuple[Any, ...]:
+    tokens = detail_tokens(detail)
+    return (
+        detail.get("timestamp") or "",
+        api_key,
+        model,
+        detail.get("latency_ms") or 0,
+        tokens.prompt,
+        tokens.cached,
+        tokens.output,
+        tokens.reasoning,
+        tokens.total,
+        bool(detail.get("failed")),
+    )
+
+
+def usage_summary_path(log_dir: Path, key: tuple[Any, ...]) -> Path:
+    raw_stamp = re.sub(r"[^0-9A-Za-z]+", "", str(key[0]))[:20] or "unknown-time"
+    digest = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()[:8]
+    return log_dir / f"usage-{raw_stamp}-{digest}.txt"
+
+
+def usage_detail_session(aggregate_api_key: str, detail: dict[str, Any]) -> str:
+    value = detail.get("api_key") or aggregate_api_key
+    value = str(value or "").strip()
+    return KNOWN_MASKED_SESSION_LABELS.get(value.lower(), value or "unknown")
+
+
+def looks_like_route_identifier(value: str) -> bool:
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    return bool(re.match(r"^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+/", value))
+
+
+def usage_detail_summary(log_dir: Path, aggregate_api_key: str, model: str, detail: dict[str, Any]) -> RequestSummary | None:
+    if not isinstance(detail, dict):
+        return None
+    timestamp = parse_datetime(str(detail.get("timestamp") or ""))
+    if timestamp is None:
+        return None
+    latency_ms = as_float(detail.get("latency_ms"))
+    duration = latency_ms / 1000.0 if latency_ms is not None else None
+    tokens = detail_tokens(detail)
+    tokens_per_second = None
+    if tokens.output is not None and duration and duration > 0:
+        tokens_per_second = tokens.output / duration
+    key = usage_event_key(aggregate_api_key, model, detail)
+    session = usage_detail_session(aggregate_api_key, detail)
+    if looks_like_route_identifier(session) or not has_tokens(tokens):
+        return None
+    endpoint = aggregate_api_key if "/" in aggregate_api_key else ""
+    method = ""
+    if endpoint:
+        parts = endpoint.split(None, 1)
+        if len(parts) == 2:
+            method, endpoint = parts
+    completed_at = timestamp + timedelta(seconds=duration or 0)
+    return RequestSummary(
+        path=usage_summary_path(log_dir, key),
+        stamp=display_datetime(timestamp).strftime("%H:%M:%S"),
+        completed_at=completed_at,
+        completed_stamp=display_datetime(completed_at).strftime("%H:%M:%S"),
+        model=str(model or "unknown"),
+        client=str(detail.get("source") or ""),
+        session=session,
+        method=method,
+        endpoint=endpoint,
+        message_count=0,
+        status="failed" if detail.get("failed") else "",
+        duration=duration,
+        finish="",
+        upstream="",
+        provider="",
+        tokens=tokens,
+        tokens_per_second=tokens_per_second,
+    )
+
+
+def usage_summaries(snapshot: dict[str, Any], log_dir: Path) -> list[tuple[tuple[Any, ...], RequestSummary]]:
+    usage = snapshot.get("usage") if isinstance(snapshot, dict) else None
+    apis = usage.get("apis") if isinstance(usage, dict) else None
+    if not isinstance(apis, dict):
+        return []
+    summaries: list[tuple[tuple[Any, ...], RequestSummary]] = []
+    for aggregate_api_key, api_snapshot in apis.items():
+        if not isinstance(api_snapshot, dict):
+            continue
+        models = api_snapshot.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model, model_snapshot in models.items():
+            if not isinstance(model_snapshot, dict):
+                continue
+            details = model_snapshot.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                key = usage_event_key(str(aggregate_api_key), str(model), detail)
+                summary = usage_detail_summary(log_dir, str(aggregate_api_key), str(model), detail)
+                if summary is not None:
+                    summaries.append((key, summary))
+    summaries.sort(key=lambda item: (item[1].completed_at or datetime.min.replace(tzinfo=timezone.utc), repr(item[0])))
+    return summaries
+
+
 def load_chatgpt_auth(auth_dir: str, auth_file: str) -> tuple[str, str, str | None]:
     candidates: list[tuple[int, str, str]] = []
     saw_codex = False
@@ -861,6 +1109,7 @@ class GroupedRenderer:
         self.current_key: tuple[str, str] | None = None
         self.current_style = ""
         self.open_group = False
+        self.rendered_requests = 0
 
     def close_group(self) -> None:
         if self.open_group:
@@ -879,20 +1128,11 @@ class GroupedRenderer:
     def render_request(self, summary: RequestSummary) -> None:
         key = summary.group_key
         style = stable_style("\0".join(key))
-        if key != self.current_key:
-            if self.current_key is not None:
-                self.close_group()
-                self.console.print()
-            self.current_key = key
-            self.current_style = style
-            self.open_group = True
-            self.console.print(self.group_header(summary, style), soft_wrap=True)
-
-        self.console.print(self.request_line(summary, style), soft_wrap=True)
-        self.console.print(self.route_line(summary, style), soft_wrap=True)
-        token_line = self.token_line(summary, style)
-        if token_line is not None:
-            self.console.print(token_line, soft_wrap=True)
+        if self.rendered_requests:
+            self.console.print()
+        self.console.print(self.compact_header_line(summary, style), soft_wrap=True)
+        self.console.print(self.compact_token_line(summary, style), soft_wrap=True)
+        self.rendered_requests += 1
 
     def group_header(self, summary: RequestSummary, style: str) -> Text:
         text = Text("╭─ ", style=style)
@@ -925,7 +1165,7 @@ class GroupedRenderer:
         tokens = summary.tokens
         if not has_tokens(tokens):
             return None
-        suspicious_cache_miss = high_input_no_cache(tokens)
+        suspicious_cache_miss = cache_miss_detected(tokens)
         fresh_style = "bold bright_white on red" if suspicious_cache_miss else f"bold {style}"
         text = Text("│  tokens  ", style=style)
         append_kv(text, "fresh", fmt_num(fresh_tokens(tokens)), fresh_style, pad=False)
@@ -938,24 +1178,22 @@ class GroupedRenderer:
             text.append("  CACHE-MISS? input>10k cached<1k", style="bold bright_white on red")
         return text
 
-    def received_line(self, summary: RequestSummary) -> Text:
-        style = stable_style("\0".join(summary.group_key))
-        text = Text("◇ HIT  ", style="bold bright_white")
-        text.append(summary.stamp, style=f"bold {style}")
+    def compact_header_line(self, summary: RequestSummary, style: str) -> Text:
+        header, _ = compact_lines(summary)
+        stamp = summary.stamp or "-"
+        model = summary.model or "unknown"
+        text = Text(stamp, style=f"bold {style}")
         text.append("  ")
-        text.append(summary.model or "unknown", style=f"bold {style}")
-        append_kv(text, "client", summary.client or "unknown", style)
-        if summary.endpoint:
-            text.append("  ")
-            if summary.method:
-                text.append(summary.method, style=f"bold {style}")
-                text.append(" ")
-            text.append(summary.endpoint, style=style)
+        text.append(model, style=f"bold {style}")
+        suffix = header.removeprefix(f"{stamp}  {model}")
+        text.append(suffix, style=style)
         return text
 
-    def render_received(self, summary: RequestSummary) -> None:
-        self.separate_from_request_group(blank=False)
-        self.console.print(self.received_line(summary), soft_wrap=True)
+    def compact_token_line(self, summary: RequestSummary, style: str) -> Text:
+        tokens = summary.tokens
+        line_style = "bold bright_white on red" if cache_miss_detected(tokens) else style
+        _, token_line = compact_lines(summary)
+        return Text(token_line, style=line_style)
 
     def usage_line(self, upstream: str, usage: dict[str, Any] | None, error: str | None = None) -> Text:
         text = Text("◇ USAGE", style="bold bright_white")
@@ -1073,10 +1311,12 @@ def log_has_response(path: Path) -> bool:
     except FileNotFoundError:
         return False
     response_text = section(text, "RESPONSE", last=True)
-    api_response_text = section(text, "API RESPONSE 1", last=True)
-    if re.search(r"\bStatus:\s*\d+", response_text or api_response_text):
+    api_response_text = section(text, "API RESPONSE 1", last=True) or section(text, "API RESPONSE", last=True)
+    api_error_response_text = section(text, "API ERROR RESPONSE", last=True)
+    response_source = "\n".join(part for part in (response_text, api_response_text, api_error_response_text) if part)
+    if re.search(r"\b(?:HTTP\s+)?Status:\s*\d+", response_source):
         return True
-    return bool(response_text.strip() or api_response_text.strip())
+    return bool(response_source.strip())
 
 
 def refresh_active_request(active: ActiveRequest) -> None:
@@ -1213,10 +1453,24 @@ class InotifyWatcher:
         os.close(self.fd)
 
 
-def render_file(renderer: GroupedRenderer, path: Path) -> None:
+def render_summary(renderer: GroupedRenderer, summary: RequestSummary, rendered_fingerprints: set[tuple[Any, ...]] | None = None) -> bool:
+    fingerprint = request_fingerprint(summary)
+    if rendered_fingerprints is not None and fingerprint in rendered_fingerprints:
+        return False
+    renderer.render_request(summary)
+    if rendered_fingerprints is not None:
+        rendered_fingerprints.add(fingerprint)
+    try:
+        write_cache_miss(summary)
+    except OSError as err:
+        renderer.console.print(f"cache-miss write failed for {summary.path}: {err}", style="red", highlight=False)
+    return True
+
+
+def render_file(renderer: GroupedRenderer, path: Path, rendered_fingerprints: set[tuple[Any, ...]] | None = None) -> None:
     summary = parse_log(path)
     if summary is not None:
-        renderer.render_request(summary)
+        render_summary(renderer, summary, rendered_fingerprints)
 
 
 def completion_sort_key(active: ActiveRequest) -> tuple[float, str]:
@@ -1241,21 +1495,33 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
     using_inotify = isinstance(watcher, InotifyWatcher)
     active_requests: dict[str, ActiveRequest] = {}
     rendered_names: set[str] = set()
+    rendered_fingerprints: set[tuple[Any, ...]] = set()
+    seen_usage_keys: set[tuple[Any, ...]] = set()
+    usage_bootstrapped = False
+    next_management_usage = 0.0
+    if args.management_usage_interval > 0:
+        snapshot = fetch_management_usage(args.base_url)
+        if snapshot is not None:
+            seen_usage_keys = {key for key, _summary in usage_summaries(snapshot, log_dir)}
+            usage_bootstrapped = True
+        next_management_usage = time.monotonic() + args.management_usage_interval
 
     console.print(f"Watching [bold]{log_dir}[/] for new request logs... (Ctrl-C to stop)", highlight=False)
     console.print("Display timezone: GMT-3", style="dim")
+    if args.management_usage_interval > 0:
+        console.print(
+            f"Live usage polling: {management_usage_url(args.base_url)} every {args.management_usage_interval:g}s",
+            style="dim",
+            highlight=False,
+        )
     if not using_inotify:
         console.print("inotify unavailable; polling for new files.", style="dim")
-    if args.usage_interval > 0:
-        console.print(f"Usage snapshots every {args.usage_interval}s from ChatGPT and Anthropic", style="dim")
-
-    next_usage = time.monotonic() + args.usage_interval if args.usage_interval > 0 else None
     try:
         with Live(Text(), console=console, auto_refresh=False, transient=True) as live:
             while True:
                 timeout = args.poll_interval
-                if next_usage is not None:
-                    timeout = min(timeout, max(0.0, next_usage - time.monotonic()))
+                if args.management_usage_interval > 0:
+                    timeout = min(timeout, max(0.0, next_management_usage - time.monotonic()))
                 for path in watcher.read(timeout):
                     if not is_request_log(path.name) or path.name in rendered_names:
                         continue
@@ -1267,9 +1533,6 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
                 completed: list[ActiveRequest] = []
                 for active in list(active_requests.values()):
                     refresh_active_request(active)
-                    if not active.announced and active.summary is not None:
-                        active.announced = True
-                        renderer.render_received(active.summary)
                     if active.stable_checks >= 1 and log_has_response(active.path):
                         completed.append(active)
 
@@ -1280,13 +1543,24 @@ def live_tail(args: argparse.Namespace, console: Console) -> None:
 
                 live.update(active_requests_text(list(active_requests.values())), refresh=True)
 
-                for active in completed:
-                    render_file(renderer, active.path)
+                if args.management_usage_interval > 0 and time.monotonic() >= next_management_usage:
+                    snapshot = fetch_management_usage(args.base_url)
+                    if snapshot is not None:
+                        pairs = usage_summaries(snapshot, log_dir)
+                        if not usage_bootstrapped:
+                            seen_usage_keys = {key for key, _summary in pairs}
+                            usage_bootstrapped = True
+                        else:
+                            for key, summary in pairs:
+                                if key in seen_usage_keys:
+                                    continue
+                                seen_usage_keys.add(key)
+                                render_summary(renderer, summary, rendered_fingerprints)
+                    next_management_usage = time.monotonic() + args.management_usage_interval
 
-                if next_usage is not None and time.monotonic() >= next_usage:
-                    live.update(Text(), refresh=True)
-                    renderer.render_usage_block(fetch_usage_snapshots(args))
-                    next_usage = time.monotonic() + args.usage_interval
+                for active in completed:
+                    render_file(renderer, active.path, rendered_fingerprints)
+
     except KeyboardInterrupt:
         console.print()
     finally:

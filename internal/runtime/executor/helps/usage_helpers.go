@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -208,7 +209,57 @@ func APIKeyFromContext(ctx context.Context) string {
 			return fmt.Sprintf("%v", value)
 		}
 	}
+	if ginCtx.Request != nil {
+		if key := localSessionLabelFromHeaders(ginCtx.Request.Header); key != "" {
+			return key
+		}
+	}
 	return ""
+}
+
+func localSessionLabelFromHeaders(headers http.Header) string {
+	for _, name := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
+		value := strings.TrimSpace(headers.Get(name))
+		if value == "" {
+			continue
+		}
+		if strings.EqualFold(name, "Authorization") {
+			parts := strings.SplitN(value, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+				value = strings.TrimSpace(parts[1])
+			}
+		}
+		if isLocalUsageSessionLabel(value) {
+			return value
+		}
+	}
+	return ""
+}
+
+func isLocalUsageSessionLabel(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"sk-", "nvapi-", "eyj", "rt_", "aiza", "venice_"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' {
+			continue
+		}
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		if char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {

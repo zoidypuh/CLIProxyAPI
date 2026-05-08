@@ -3,9 +3,11 @@ package helps
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
@@ -182,5 +184,51 @@ func TestNewUsageReporterCapturesSanitizedSessionIDMetadata(t *testing.T) {
 	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
 	if record.SessionID != "hermes-session-123" {
 		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
+	}
+}
+
+func TestAPIKeyFromContextUsesGinAPIKeyFirst(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer hermes")
+	ginCtx.Set("apiKey", "qwen-delegate")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := APIKeyFromContext(ctx); got != "qwen-delegate" {
+		t.Fatalf("APIKeyFromContext() = %q, want %q", got, "qwen-delegate")
+	}
+}
+
+func TestAPIKeyFromContextFallsBackToLocalSessionLabelHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer hermes")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := APIKeyFromContext(ctx); got != "hermes" {
+		t.Fatalf("APIKeyFromContext() = %q, want %q", got, "hermes")
+	}
+}
+
+func TestAPIKeyFromContextDoesNotFallbackToSecretLikeHeader(t *testing.T) {
+	tests := []string{
+		"Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+		"Bearer sk-local-codex",
+		"Bearer nvapi-123456",
+	}
+	for _, authHeader := range tests {
+		t.Run(authHeader, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			ginCtx.Request.Header.Set("Authorization", authHeader)
+
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			if got := APIKeyFromContext(ctx); got != "" {
+				t.Fatalf("APIKeyFromContext() = %q, want empty", got)
+			}
+		})
 	}
 }

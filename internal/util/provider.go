@@ -187,9 +187,41 @@ func HideAPIKey(apiKey string) string {
 func MaskAuthorizationHeader(value string) string {
 	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
 	if len(parts) < 2 {
+		if isLocalSessionLabel(value) {
+			return strings.TrimSpace(value)
+		}
 		return HideAPIKey(value)
 	}
+	if isLocalSessionLabel(parts[1]) {
+		return parts[0] + " " + strings.TrimSpace(parts[1])
+	}
 	return parts[0] + " " + HideAPIKey(parts[1])
+}
+
+func isLocalSessionLabel(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"sk-", "nvapi-", "eyj", "rt_", "AIza", "venice_"} {
+		if strings.HasPrefix(lower, strings.ToLower(prefix)) {
+			return false
+		}
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' {
+			continue
+		}
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		if char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // MaskSensitiveHeaderValue masks sensitive header values while preserving expected formats.
