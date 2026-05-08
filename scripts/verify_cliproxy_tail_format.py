@@ -265,8 +265,8 @@ def main() -> int:
             miss_summary,
             "bright_cyan",
         )
-        if str(miss_line.style) != "bold bright_white on red":
-            raise AssertionError(f"cache-miss line style = {miss_line.style!r}, want red highlight")
+        if str(miss_line.style) == "bold bright_white on red":
+            raise AssertionError("non-Hermes cache-miss should not be highlighted red")
         render_file(module, miss_path)
         miss_copy = Path(tmp) / "cache-miss" / "v1-cache-miss.log.txt"
         if miss_copy.exists():
@@ -275,6 +275,15 @@ def main() -> int:
         hermes_miss_path = Path(tmp) / "v1-cache-miss-hermes.log"
         hermes_miss_log = sample_log(prompt=12_000, cached=0, output=100, auth="hermes")
         hermes_miss_path.write_text(hermes_miss_log, encoding="utf-8")
+        hermes_miss_summary = module.parse_log(hermes_miss_path)
+        if hermes_miss_summary is None:
+            raise AssertionError("Hermes cache-miss summary did not parse")
+        hermes_miss_line = module.GroupedRenderer(Console(file=StringIO())).compact_token_line(
+            hermes_miss_summary,
+            "bright_cyan",
+        )
+        if str(hermes_miss_line.style) != "bold bright_white on red":
+            raise AssertionError(f"Hermes cache-miss line style = {hermes_miss_line.style!r}, want red highlight")
         render_file(module, hermes_miss_path)
         miss_copy = Path(tmp) / "cache-miss" / "v1-cache-miss-hermes.log.txt"
         if not miss_copy.exists():

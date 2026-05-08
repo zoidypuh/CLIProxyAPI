@@ -44,7 +44,6 @@ KNOWN_MASKED_SESSION_LABELS = {
     "qw...te": "qwen-delegate",
     "qwen...gate": "qwen-delegate",
 }
-HERMES_CACHE_MISS_SESSIONS = {"hermes", "lola"}
 
 
 @dataclass
@@ -729,19 +728,12 @@ def cache_miss_output_path(source: Path) -> Path:
     return source.parent / "cache-miss" / f"{source.name}.txt"
 
 
-def is_hermes_request(summary: RequestSummary) -> bool:
-    session = (summary.session or "").strip().lower()
-    client = (summary.client or "").strip().lower()
-    model = (summary.model or "").strip().lower()
-    return (
-        session in HERMES_CACHE_MISS_SESSIONS
-        or client == "hermes agent"
-        or model == "codex-hermes"
-    )
+def marked_cache_miss(summary: RequestSummary) -> bool:
+    return cache_miss_detected(summary.tokens) and (summary.session or "").strip().lower() == "hermes"
 
 
 def write_cache_miss(summary: RequestSummary) -> Path | None:
-    if not cache_miss_detected(summary.tokens) or not is_hermes_request(summary):
+    if not marked_cache_miss(summary):
         return None
     if not summary.path.is_file():
         return None
@@ -1178,7 +1170,7 @@ class GroupedRenderer:
         tokens = summary.tokens
         if not has_tokens(tokens):
             return None
-        suspicious_cache_miss = cache_miss_detected(tokens)
+        suspicious_cache_miss = marked_cache_miss(summary)
         fresh_style = "bold bright_white on red" if suspicious_cache_miss else f"bold {style}"
         text = Text("│  tokens  ", style=style)
         append_kv(text, "fresh", fmt_num(fresh_tokens(tokens)), fresh_style, pad=False)
@@ -1204,7 +1196,7 @@ class GroupedRenderer:
 
     def compact_token_line(self, summary: RequestSummary, style: str) -> Text:
         tokens = summary.tokens
-        line_style = "bold bright_white on red" if cache_miss_detected(tokens) else style
+        line_style = "bold bright_white on red" if marked_cache_miss(summary) else style
         _, token_line = compact_lines(summary)
         return Text(token_line, style=line_style)
 
