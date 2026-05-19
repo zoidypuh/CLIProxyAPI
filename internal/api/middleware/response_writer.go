@@ -25,6 +25,7 @@ type RequestInfo struct {
 	Headers   map[string][]string // Headers contains the request headers.
 	Body      []byte              // Body is the raw request body.
 	RequestID string              // RequestID is the unique identifier for the request.
+	LogFile   string              // LogFile is the expected request log filename.
 	Timestamp time.Time           // Timestamp is when the request was received.
 }
 

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"strings"
@@ -8,8 +9,10 @@ import (
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 type openAICompatPoolExecutor struct {
@@ -440,6 +443,91 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolRetriesOnEmptyBootstrap(t *te
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolLogsEmptyBootstrap(t *testing.T) {
+	var logBuffer bytes.Buffer
+	logger := log.StandardLogger()
+	originalOutput := logger.Out
+	originalFormatter := logger.Formatter
+	originalLevel := logger.GetLevel()
+	originalReportCaller := logger.ReportCaller
+	logger.SetOutput(&logBuffer)
+	logger.SetFormatter(&internallogging.LogFormatter{})
+	logger.SetLevel(log.WarnLevel)
+	logger.SetReportCaller(false)
+	t.Cleanup(func() {
+		logger.SetOutput(originalOutput)
+		logger.SetFormatter(originalFormatter)
+		logger.SetLevel(originalLevel)
+		logger.SetReportCaller(originalReportCaller)
+	})
+
+	alias := "claude-opus-4.66"
+	executor := &openAICompatPoolExecutor{
+		id: "pool",
+		streamPayloads: map[string][]cliproxyexecutor.StreamChunk{
+			"deepseek-v3.1": {},
+		},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "deepseek-v3.1", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	ctx := internallogging.WithRequestID(context.Background(), "req-empty")
+	streamResult, err := m.ExecuteStream(ctx, []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	if payload := readOpenAICompatStreamPayload(t, streamResult); payload != "glm-5" {
+		t.Fatalf("payload = %q, want %q", payload, "glm-5")
+	}
+
+	logText := logBuffer.String()
+	for _, want := range []string{
+		"[req-empty]",
+		"upstream stream closed before first payload",
+		"provider=pool",
+		"auth_id=pool-aut...",
+		"model=deepseek-v3.1",
+		"route_model=claude-opus-4.66",
+		"exec_model=deepseek-v3.1",
+		"attempt=1",
+		"attempts=2",
+		"upstream_status=stream_opened",
+		"upstream_headers=X-Model=deepseek-v3.1",
+		"error=empty_stream",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("log output missing %q:\n%s", want, logText)
+		}
+	}
+	if strings.Contains(logText, "pool-auth-"+t.Name()) {
+		t.Fatalf("log output contains full auth id:\n%s", logText)
+	}
+}
+
+func TestHeadersForLogRedactsSensitiveHeaders(t *testing.T) {
+	got := headersForLog(http.Header{
+		"Authorization": {"Bearer secret-token"},
+		"Set-Cookie":    {"session=secret"},
+		"X-Request-Id":  {"req\n123"},
+	})
+	for _, want := range []string{
+		"Authorization=[redacted]",
+		"Set-Cookie=[redacted]",
+		`X-Request-Id=req\n123`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("headersForLog() missing %q in %q", want, got)
+		}
+	}
+	for _, forbidden := range []string{"secret-token", "session=secret"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("headersForLog() leaked %q in %q", forbidden, got)
 		}
 	}
 }

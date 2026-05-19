@@ -71,6 +71,8 @@ type RequestStatistics struct {
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+
+	subscribers map[chan RequestEvent]struct{}
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -95,6 +97,8 @@ type RequestDetail struct {
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	SessionID string     `json:"session_id,omitempty"`
+	RequestID string     `json:"request_id,omitempty"`
+	LogFile   string     `json:"log_file,omitempty"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
 }
@@ -157,6 +161,7 @@ func NewRequestStatistics() *RequestStatistics {
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
+		subscribers:    make(map[chan RequestEvent]struct{}),
 	}
 }
 
@@ -178,6 +183,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
 	}
+	detailAPIKey := strings.TrimSpace(record.APIKey)
 	failed := record.Failed
 	if !failed {
 		failed = !resolveSuccess(ctx)
@@ -187,11 +193,22 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	eventDetail := RequestDetail{
+		Timestamp: timestamp,
+		LatencyMs: normaliseLatency(record.Latency),
+		APIKey:    detailAPIKey,
+		Source:    record.Source,
+		AuthIndex: record.AuthIndex,
+		SessionID: strings.TrimSpace(record.SessionID),
+		RequestID: strings.TrimSpace(record.RequestID),
+		LogFile:   strings.TrimSpace(record.LogFile),
+		Tokens:    detail,
+		Failed:    failed,
+	}
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.totalRequests++
 	if success {
@@ -206,21 +223,60 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		stats = &apiStats{Models: make(map[string]*modelStats)}
 		s.apis[statsKey] = stats
 	}
-	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
-		APIKey:    strings.TrimSpace(statsKey),
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		SessionID: strings.TrimSpace(record.SessionID),
-		Tokens:    detail,
-		Failed:    failed,
-	})
+	s.updateAPIStats(stats, modelName, eventDetail)
 
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+
+	event := RequestEvent{
+		APIKey: firstNonEmpty(detailAPIKey, displayableAggregateAPIKey(statsKey)),
+		Model:  modelName,
+		Detail: eventDetail,
+	}
+	subscribers := make([]chan RequestEvent, 0, len(s.subscribers))
+	for subscriber := range s.subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	s.mu.Unlock()
+
+	for _, subscriber := range subscribers {
+		select {
+		case subscriber <- event:
+		default:
+		}
+	}
+}
+
+// Subscribe returns a channel that receives new request usage events.
+func (s *RequestStatistics) Subscribe(buffer int) (<-chan RequestEvent, func()) {
+	if s == nil {
+		closed := make(chan RequestEvent)
+		close(closed)
+		return closed, func() {}
+	}
+	if buffer <= 0 {
+		buffer = 1
+	}
+	ch := make(chan RequestEvent, buffer)
+	s.mu.Lock()
+	if s.subscribers == nil {
+		s.subscribers = make(map[chan RequestEvent]struct{})
+	}
+	s.subscribers[ch] = struct{}{}
+	s.mu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			delete(s.subscribers, ch)
+			close(ch)
+			s.mu.Unlock()
+		})
+	}
+	return ch, unsubscribe
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -254,7 +310,7 @@ func FilterRequestEvents(snapshot StatisticsSnapshot, modelAlias, apiKey string)
 				continue
 			}
 			for _, detail := range modelSnapshot.Details {
-				detail.APIKey = firstNonEmpty(detail.APIKey, aggregateAPIKey)
+				detail.APIKey = firstNonEmpty(detail.APIKey, displayableAggregateAPIKey(aggregateAPIKey))
 				if apiKey != "" && detail.APIKey != apiKey {
 					continue
 				}
@@ -276,6 +332,27 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func displayableAggregateAPIKey(value string) string {
+	value = strings.TrimSpace(value)
+	if isRouteIdentifier(value) {
+		return ""
+	}
+	return value
+}
+
+func isRouteIdentifier(value string) bool {
+	parts := strings.Fields(strings.TrimSpace(value))
+	if len(parts) != 2 || !strings.HasPrefix(parts[1], "/") {
+		return false
+	}
+	switch strings.ToUpper(parts[0]) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD":
+		return true
+	default:
+		return false
+	}
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -304,7 +381,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
 			copy(requestDetails, modelStatsValue.Details)
 			for i := range requestDetails {
-				requestDetails[i].APIKey = firstNonEmpty(requestDetails[i].APIKey, apiName)
+				requestDetails[i].APIKey = firstNonEmpty(requestDetails[i].APIKey, displayableAggregateAPIKey(apiName))
 			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
@@ -390,7 +467,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				detail.APIKey = firstNonEmpty(detail.APIKey, apiName)
+				detail.APIKey = firstNonEmpty(detail.APIKey, displayableAggregateAPIKey(apiName))
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}

@@ -2,9 +2,12 @@ package usage
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -29,6 +32,33 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 	if details[0].LatencyMs != 1500 {
 		t.Fatalf("latency_ms = %d, want 1500", details[0].LatencyMs)
+	}
+}
+
+func TestRequestStatisticsRecordIncludesRequestLogMetadata(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestID:   "a1b2c3d4",
+		LogFile:     "v1-responses-2026-05-14T123456-a1b2c3d4.log",
+		RequestedAt: time.Date(2026, 5, 14, 12, 34, 56, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens: 1,
+			TotalTokens: 1,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestID != "a1b2c3d4" {
+		t.Fatalf("request_id = %q, want a1b2c3d4", details[0].RequestID)
+	}
+	if details[0].LogFile != "v1-responses-2026-05-14T123456-a1b2c3d4.log" {
+		t.Fatalf("log_file = %q", details[0].LogFile)
 	}
 }
 
@@ -169,5 +199,59 @@ func TestFilterRequestEventsBackfillsImportedRowsMissingDetailAPIKey(t *testing.
 	}
 	if events[0].Detail.APIKey != "qwen-delegate" {
 		t.Fatalf("detail.api_key = %q, want qwen-delegate", events[0].Detail.APIKey)
+	}
+}
+
+func TestRouteIdentifierIsNotBackfilledAsAPIKey(t *testing.T) {
+	snapshot := StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"POST /v1/chat/completions": {
+				Models: map[string]ModelSnapshot{
+					"codex-hermes": {
+						Details: []RequestDetail{{
+							Timestamp: time.Date(2026, 5, 8, 14, 0, 0, 0, time.UTC),
+							Tokens: TokenStats{
+								InputTokens: 10,
+								TotalTokens: 10,
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	events := FilterRequestEvents(snapshot, "codex-hermes", "")
+	if len(events) != 1 {
+		t.Fatalf("events len = %d, want 1", len(events))
+	}
+	if events[0].APIKey != "" || events[0].Detail.APIKey != "" {
+		t.Fatalf("route identifier was exposed as api key: event=%q detail=%q", events[0].APIKey, events[0].Detail.APIKey)
+	}
+}
+
+func TestRequestStatisticsRecordDoesNotStoreRouteAsDetailAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.AddParam("unused", "unused")
+
+	stats := NewRequestStatistics()
+	stats.Record(context.WithValue(context.Background(), "gin", ginCtx), coreusage.Record{
+		Model:       "codex-hermes",
+		RequestedAt: time.Date(2026, 5, 8, 15, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens: 10,
+			TotalTokens: 10,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["POST /v1/chat/completions"].Models["codex-hermes"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].APIKey != "" {
+		t.Fatalf("detail.api_key = %q, want empty", details[0].APIKey)
 	}
 }

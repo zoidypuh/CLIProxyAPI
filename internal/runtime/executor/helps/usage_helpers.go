@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
@@ -26,6 +27,8 @@ type UsageReporter struct {
 	apiKey      string
 	source      string
 	sessionID   string
+	requestID   string
+	logFile     string
 	requestedAt time.Time
 	once        sync.Once
 }
@@ -40,6 +43,11 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	if len(opts) > 0 {
 		sessionID = UsageSessionID(opts[0])
 	}
+	if isLocalUsageSessionLabel(apiKey) {
+		sessionID = apiKey
+	} else if strings.EqualFold(provider, "codex") && looksLikeUUIDSessionID(sessionID) {
+		sessionID = "codex"
+	}
 	reporter := &UsageReporter{
 		provider:    provider,
 		model:       usageModel,
@@ -48,6 +56,13 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
 		sessionID:   sessionID,
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		reporter.requestID = internallogging.GetGinRequestID(ginCtx)
+		reporter.logFile = internallogging.GetGinRequestLogFile(ginCtx)
+	}
+	if reporter.requestID == "" {
+		reporter.requestID = internallogging.GetRequestID(ctx)
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -157,6 +172,8 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthIndex:   r.authIndex,
 		AuthType:    r.authType,
 		SessionID:   r.sessionID,
+		RequestID:   r.requestID,
+		LogFile:     r.logFile,
 		RequestedAt: r.requestedAt,
 		Latency:     r.latency(),
 		Failed:      failed,
@@ -178,6 +195,26 @@ func UsageSessionID(opts cliproxyexecutor.Options) string {
 		}
 	}
 	return ""
+}
+
+func looksLikeUUIDSessionID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 {
+		return false
+	}
+	for i, char := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (r *UsageReporter) latency() time.Duration {

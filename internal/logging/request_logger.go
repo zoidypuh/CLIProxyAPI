@@ -237,9 +237,9 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 	}
 
 	// Generate filename with request ID
-	filename := l.generateFilename(url, requestID)
+	filename := l.generateFilenameAt(url, requestTimestamp, requestID)
 	if force && !l.enabled {
-		filename = l.generateErrorFilename(url, requestID)
+		filename = l.generateErrorFilenameAt(url, requestTimestamp, requestID)
 	}
 	filePath := filepath.Join(l.logsDir, filename)
 
@@ -372,7 +372,11 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 
 // generateErrorFilename creates a filename with an error prefix to differentiate forced error logs.
 func (l *FileRequestLogger) generateErrorFilename(url string, requestID ...string) string {
-	return fmt.Sprintf("error-%s", l.generateFilename(url, requestID...))
+	return l.generateErrorFilenameAt(url, time.Now(), requestID...)
+}
+
+func (l *FileRequestLogger) generateErrorFilenameAt(url string, timestamp time.Time, requestID ...string) string {
+	return fmt.Sprintf("error-%s", l.generateFilenameAt(url, timestamp, requestID...))
 }
 
 // ensureLogsDir creates the logs directory if it doesn't exist.
@@ -396,6 +400,24 @@ func (l *FileRequestLogger) ensureLogsDir() error {
 // Returns:
 //   - string: A sanitized filename for the log file
 func (l *FileRequestLogger) generateFilename(url string, requestID ...string) string {
+	return l.generateFilenameAt(url, time.Now(), requestID...)
+}
+
+func (l *FileRequestLogger) generateFilenameAt(url string, timestamp time.Time, requestID ...string) string {
+	// Use request ID if provided, otherwise use sequential ID
+	var idPart string
+	if len(requestID) > 0 && requestID[0] != "" {
+		idPart = requestID[0]
+	} else {
+		id := requestLogID.Add(1)
+		idPart = fmt.Sprintf("%d", id)
+	}
+
+	return RequestLogFileName(url, timestamp, idPart)
+}
+
+// RequestLogFileName returns the request-log filename used for a URL, timestamp, and request ID.
+func RequestLogFileName(url string, timestamp time.Time, requestID string) string {
 	// Extract path from URL
 	path := url
 	if strings.Contains(url, "?") {
@@ -408,21 +430,14 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	}
 
 	// Sanitize path for filename
-	sanitized := l.sanitizeForFilename(path)
+	sanitized := sanitizeRequestLogPath(path)
 
 	// Add timestamp
-	timestamp := time.Now().Format("2006-01-02T150405")
-
-	// Use request ID if provided, otherwise use sequential ID
-	var idPart string
-	if len(requestID) > 0 && requestID[0] != "" {
-		idPart = requestID[0]
-	} else {
-		id := requestLogID.Add(1)
-		idPart = fmt.Sprintf("%d", id)
+	if timestamp.IsZero() {
+		timestamp = time.Now()
 	}
 
-	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
+	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp.Format("2006-01-02T150405"), requestID)
 }
 
 // sanitizeForFilename replaces characters that are not safe for filenames.
@@ -433,6 +448,10 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 // Returns:
 //   - string: A sanitized filename
 func (l *FileRequestLogger) sanitizeForFilename(path string) string {
+	return sanitizeRequestLogPath(path)
+}
+
+func sanitizeRequestLogPath(path string) string {
 	// Replace slashes with hyphens
 	sanitized := strings.ReplaceAll(path, "/", "-")
 

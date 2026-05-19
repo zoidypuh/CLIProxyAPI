@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -119,6 +120,7 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		rawJSON = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 	}
+	rawJSON = forceHermesGPT55ReasoningEffort(rawJSON, c.Request.Header)
 
 	if stream {
 		h.handleStreamingResponse(c, rawJSON)
@@ -141,6 +143,60 @@ func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
 		return true
 	}
 	return false
+}
+
+func forceHermesGPT55ReasoningEffort(rawJSON []byte, headers http.Header) []byte {
+	if !isHermesGPT55Request(rawJSON, headers) {
+		return rawJSON
+	}
+
+	updated := rawJSON
+	if next, err := sjson.SetBytes(updated, "reasoning_effort", "high"); err == nil {
+		updated = next
+	}
+	if gjson.GetBytes(updated, "reasoning.effort").Exists() {
+		if next, err := sjson.SetBytes(updated, "reasoning.effort", "high"); err == nil {
+			updated = next
+		}
+	}
+	return updated
+}
+
+func forceHermesGPT55ResponsesReasoningEffort(rawJSON []byte, headers http.Header) []byte {
+	if !isHermesGPT55Request(rawJSON, headers) {
+		return rawJSON
+	}
+
+	if next, err := sjson.SetBytes(rawJSON, "reasoning.effort", "high"); err == nil {
+		return next
+	}
+	return rawJSON
+}
+
+func isHermesGPT55Request(rawJSON []byte, headers http.Header) bool {
+	if !isHermesClientRequest(headers) {
+		return false
+	}
+	return strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()) == "gpt-5.5"
+}
+
+func isHermesClientRequest(headers http.Header) bool {
+	for _, name := range []string{"Authorization", "X-Api-Key", "Api-Key"} {
+		for _, value := range headers.Values(name) {
+			if clientTokenName(value) == "hermes" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func clientTokenName(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		value = strings.TrimSpace(value[len("bearer "):])
+	}
+	return strings.ToLower(value)
 }
 
 // Completions handles the /v1/completions endpoint.

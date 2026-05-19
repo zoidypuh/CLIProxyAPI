@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
@@ -165,6 +166,73 @@ func TestNewUsageReporterCapturesSessionIDHeader(t *testing.T) {
 	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
 	if record.SessionID != "hermes-session-123" {
 		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
+	}
+}
+
+func TestNewUsageReporterCapturesRequestLogMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	internallogging.SetGinRequestID(ginCtx, "a1b2c3d4")
+	internallogging.SetGinRequestLogFile(ginCtx, "v1-responses-2026-05-14T123456-a1b2c3d4.log")
+
+	reporter := NewUsageReporter(
+		context.WithValue(context.Background(), "gin", ginCtx),
+		"codex",
+		"gpt-5.5",
+		nil,
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.RequestID != "a1b2c3d4" {
+		t.Fatalf("record.RequestID = %q, want %q", record.RequestID, "a1b2c3d4")
+	}
+	if record.LogFile != "v1-responses-2026-05-14T123456-a1b2c3d4.log" {
+		t.Fatalf("record.LogFile = %q", record.LogFile)
+	}
+}
+
+func TestNewUsageReporterUsesLocalClientLabelAsSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer codex")
+	ginCtx.Set("apiKey", "codex")
+
+	reporter := NewUsageReporter(
+		context.WithValue(context.Background(), "gin", ginCtx),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"019e1bf7-c759-74a0-a7a3-aec4c8bb6316"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "codex" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "codex")
+	}
+}
+
+func TestNewUsageReporterCollapsesUnlabeledCodexUUIDSession(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"019e1bf7-c759-74a0-a7a3-aec4c8bb6316"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "codex" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "codex")
 	}
 }
 

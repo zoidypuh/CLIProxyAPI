@@ -18,6 +18,8 @@ type Record struct {
 	AuthType    string
 	Source      string
 	SessionID   string
+	RequestID   string
+	LogFile     string
 	RequestedAt time.Time
 	Latency     time.Duration
 	Failed      bool

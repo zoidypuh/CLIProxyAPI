@@ -701,6 +701,91 @@ func cloneHTTPHeader(headers http.Header) http.Header {
 	return headers.Clone()
 }
 
+func shortAuthIDForLog(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	id := strings.TrimSpace(auth.ID)
+	if len(id) <= 16 {
+		return id
+	}
+	return id[:8] + "..." + id[len(id)-4:]
+}
+
+func sensitiveHeaderForLog(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(name, "authorization") ||
+		strings.Contains(name, "cookie") ||
+		strings.Contains(name, "token") ||
+		strings.Contains(name, "api-key") ||
+		strings.Contains(name, "apikey") ||
+		strings.Contains(name, "secret")
+}
+
+func sanitizeHeaderValueForLog(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.NewReplacer("\r", `\r`, "\n", `\n`, "\t", " ").Replace(value)
+	if len(value) > 160 {
+		value = value[:157] + "..."
+	}
+	return value
+}
+
+func headersForLog(headers http.Header) string {
+	if len(headers) == 0 {
+		return "-"
+	}
+	type headerEntry struct {
+		name   string
+		values []string
+	}
+	entries := make([]headerEntry, 0, len(headers))
+	for name, values := range headers {
+		name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		entries = append(entries, headerEntry{name: name, values: append([]string(nil), values...)})
+	}
+	if len(entries) == 0 {
+		return "-"
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return strings.ToLower(entries[i].name) < strings.ToLower(entries[j].name)
+	})
+	parts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if sensitiveHeaderForLog(entry.name) {
+			parts = append(parts, entry.name+"=[redacted]")
+			continue
+		}
+		values := make([]string, 0, len(entry.values))
+		for _, value := range entry.values {
+			values = append(values, sanitizeHeaderValueForLog(value))
+		}
+		if len(values) == 0 {
+			values = append(values, "")
+		}
+		parts = append(parts, entry.name+"="+strings.Join(values, "|"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func logEmptyStreamBootstrap(ctx context.Context, auth *Auth, provider, routeModel, execModel, resultModel string, attempt, attempts int, headers http.Header) {
+	logEntryWithRequestID(ctx).WithFields(log.Fields{
+		"provider":         provider,
+		"auth_id":          shortAuthIDForLog(auth),
+		"model":            resultModel,
+		"route_model":      routeModel,
+		"exec_model":       execModel,
+		"attempt":          attempt,
+		"attempts":         attempts,
+		"upstream_status":  "stream_opened",
+		"upstream_headers": headersForLog(headers),
+		"error":            "empty_stream",
+	}).Warn("upstream stream closed before first payload")
+}
+
 func newStreamBootstrapError(err error, headers http.Header) error {
 	if err == nil {
 		return nil
@@ -895,6 +980,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
+			logEmptyStreamBootstrap(ctx, auth, provider, routeModel, execModel, resultModel, idx+1, len(execModels), streamResult.Headers)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue

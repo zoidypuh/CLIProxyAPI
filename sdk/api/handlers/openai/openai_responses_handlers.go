@@ -254,6 +254,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		})
 		return
 	}
+	rawJSON = forceHermesGPT55ResponsesReasoningEffort(rawJSON, c.Request.Header)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -276,6 +277,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		})
 		return
 	}
+	rawJSON = forceHermesGPT55ResponsesReasoningEffort(rawJSON, c.Request.Header)
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
