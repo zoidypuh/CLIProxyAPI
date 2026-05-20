@@ -11,6 +11,7 @@
   var REQUEST_EVENTS_HASH = "#/request-events";
   var AUTO_CALIBRATION_TITLE = "Automatic Calibration";
   var REQUEST_EVENTS_TITLE = "Request Events";
+  var CHART_LINES_TITLE = "Lines to display";
   var USAGE_PAGE_TITLE = "Usage Statistics";
   var AUTH_FILES_PAGE_TITLE = "Auth Files";
   var REQUEST_EVENTS_STYLE_ID = "cliproxy-request-events-style";
@@ -18,8 +19,12 @@
   var REQUEST_EVENTS_HEADER_CONTROLS_ID = "cliproxy-request-events-header-controls";
   var REQUEST_EVENTS_PAGER_ID = "cliproxy-request-events-pager";
   var REQUEST_EVENTS_TOP_ROW_ID = "cliproxy-request-events-top-row";
+  var REQUEST_EVENTS_COPY_FALLBACK_ID = "cliproxy-request-events-copy-fallback";
   var REQUEST_EVENTS_PAGE_SIZE = 100;
   var REQUEST_EVENTS_BOOT_FLAG = "cliproxyRequestEventsBoot";
+  var REQUEST_EVENTS_LOG_ROOT = "\\\\wsl.localhost\\Ubuntu-24.04\\home\\gismar\\.cli-proxy-api\\logs";
+  var CHART_LINES_REFRESH_ID = "cliproxy-chart-lines-refresh";
+  var CHART_LINES_OBSERVER_FLAG = "cliproxyChartLinesObserver";
   var CLAUDE_CLOAK_PANEL_ID = "cliproxy-claude-cloak-panel";
   var CLAUDE_CLOAK_STYLE_ID = "cliproxy-claude-cloak-style";
   var REQUEST_EVENTS_ICON_SVG =
@@ -501,12 +506,27 @@
     }
   }
 
+  function moveTokenSummaryToRequestEventsToolbar(requestEvents) {
+    if (!requestEvents) {
+      return;
+    }
+
+    var toolbar = requestEvents.querySelector('[class*="UsagePage-module__requestEventsToolbar"]');
+    var tokenSummary = requestEvents.querySelector('[class*="UsagePage-module__requestEventsTokenSummary"]');
+    if (!toolbar || !tokenSummary || tokenSummary.parentElement === toolbar) {
+      return;
+    }
+
+    toolbar.appendChild(tokenSummary);
+  }
+
   function formatRequestEventsBlock(requestEvents) {
     if (!requestEvents) {
       return;
     }
     requestEvents.id = REQUEST_EVENTS_CARD_ID;
     ensureRequestEventsTopRow(requestEvents);
+    moveTokenSummaryToRequestEventsToolbar(requestEvents);
   }
 
   function setRequestEventsPage(index) {
@@ -603,6 +623,201 @@
     }
   }
 
+  function normalizeRequestEventsLogName(value) {
+    value = String(value || "").trim().replace(/^"+|"+$/g, "");
+    if (!value) {
+      return "";
+    }
+    value = value
+      .replace(/^\/home\/gismar\/\.cli-proxy-api\/logs\/?/i, "")
+      .replace(/^\\\\wsl\.localhost\\Ubuntu-24\.04\\home\\gismar\\\.cli-proxy-api\\logs\\?/i, "")
+      .replace(/^logs[\\/]/i, "")
+      .replace(/[\\/]+/g, "\\");
+    return value.replace(/^\\+/, "");
+  }
+
+  function buildRequestEventsLogPath(logName) {
+    logName = normalizeRequestEventsLogName(logName);
+    return logName ? REQUEST_EVENTS_LOG_ROOT + "\\" + logName : "";
+  }
+
+  function showRequestEventsCopyFallback(path) {
+    var requestEvents = findDirectUsageChild(REQUEST_EVENTS_TITLE);
+    if (!requestEvents) {
+      window.prompt("Copy log path", path);
+      return;
+    }
+
+    var fallback = document.getElementById(REQUEST_EVENTS_COPY_FALLBACK_ID);
+    if (!fallback) {
+      fallback = document.createElement("div");
+      fallback.id = REQUEST_EVENTS_COPY_FALLBACK_ID;
+      fallback.innerHTML =
+        '<span>Log path</span><input type="text" readonly aria-label="Log path" />';
+    }
+
+    var input = fallback.querySelector("input");
+    if (input) {
+      input.value = path;
+    }
+
+    var tableWrapper = requestEvents.querySelector('[class*="UsagePage-module__requestEventsTableWrapper"]');
+    if (tableWrapper && fallback.parentElement !== requestEvents) {
+      requestEvents.insertBefore(fallback, tableWrapper);
+    }
+    if (input) {
+      input.focus();
+      input.select();
+    }
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      return navigator.clipboard.writeText(text).then(
+        function () {
+          return true;
+        },
+        function () {
+          return false;
+        }
+      );
+    }
+
+    return new Promise(function (resolve) {
+      var input = document.createElement("textarea");
+      input.value = text;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      input.style.top = "0";
+      document.body.appendChild(input);
+      input.focus();
+      input.select();
+      try {
+        resolve(document.execCommand("copy"));
+      } catch (_) {
+        resolve(false);
+      } finally {
+        input.remove();
+      }
+    });
+  }
+
+  function patchRequestEventsLogCopy() {
+    if (window.__cliproxyRequestEventsLogCopyPatched) {
+      return;
+    }
+    document.addEventListener(
+      "click",
+      function (event) {
+        if (!isRequestEventsRoute()) {
+          return;
+        }
+        var button = event.target && event.target.closest ? event.target.closest("button") : null;
+        if (!button || normalizedText(button).toLowerCase() !== "copy") {
+          return;
+        }
+        var fullPath = buildRequestEventsLogPath(button.getAttribute("title") || "");
+        if (!fullPath) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        }
+
+        copyText(fullPath).then(function (copied) {
+          if (!copied) {
+            showRequestEventsCopyFallback(fullPath);
+          }
+        });
+      },
+      true
+    );
+    window.__cliproxyRequestEventsLogCopyPatched = true;
+  }
+
+  function scheduleUsageChartReflow() {
+    window.setTimeout(function () {
+      window.dispatchEvent(new Event("resize"));
+      if (window.Chart && window.Chart.instances) {
+        try {
+          Object.keys(window.Chart.instances).forEach(function (key) {
+            var chart = window.Chart.instances[key];
+            if (chart && typeof chart.update === "function") {
+              chart.update();
+            }
+          });
+        } catch (_) {
+          // Resize dispatch above still covers the normal Chart.js path.
+        }
+      }
+    }, 60);
+  }
+
+  function findHeaderRefreshButton() {
+    var buttons = document.querySelectorAll("button");
+    for (var i = 0; i < buttons.length; i++) {
+      var text = normalizedText(buttons[i]);
+      if (text === "Refresh" || text === "刷新") {
+        return buttons[i];
+      }
+    }
+    return null;
+  }
+
+  function ensureChartLineControls() {
+    if (isRequestEventsRoute()) {
+      return;
+    }
+    var chartCard = findCard(CHART_LINES_TITLE);
+    if (!chartCard) {
+      return;
+    }
+
+    var header =
+      chartCard.querySelector(".card-header") ||
+      chartCard.querySelector('[class*="card-header"]') ||
+      chartCard.firstElementChild;
+    if (header) {
+      var extra =
+        header.querySelector('[class*="UsagePage-module__chartLineHeader"]') ||
+        header.lastElementChild;
+      if (extra && !document.getElementById(CHART_LINES_REFRESH_ID)) {
+        var refresh = document.createElement("button");
+        refresh.id = CHART_LINES_REFRESH_ID;
+        refresh.type = "button";
+        refresh.className = "btn btn-secondary btn-sm";
+        refresh.textContent = "Refresh";
+        refresh.addEventListener("click", function () {
+          var headerRefresh = findHeaderRefreshButton();
+          if (headerRefresh) {
+            headerRefresh.click();
+          }
+          scheduleUsageChartReflow();
+        });
+        extra.appendChild(refresh);
+      }
+    }
+
+    if (chartCard.dataset[CHART_LINES_OBSERVER_FLAG] === "1") {
+      return;
+    }
+    chartCard.dataset[CHART_LINES_OBSERVER_FLAG] = "1";
+    var observer = new MutationObserver(function () {
+      scheduleUsageChartReflow();
+    });
+    observer.observe(chartCard, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-expanded", "title"],
+    });
+  }
+
   function updateUsagePageTitle(header, title) {
     if (!header) {
       return;
@@ -631,6 +846,8 @@
 
     ensureRequestEventsNavigation();
     ensureRequestEventsStyles();
+    patchRequestEventsLogCopy();
+    ensureChartLineControls();
     document.documentElement.classList.toggle("cliproxy-request-events-route", requestMode);
     if (requestMode && window.location.hash !== REQUEST_EVENTS_HASH) {
       window.history.replaceState(null, "", REQUEST_EVENTS_HASH);
@@ -706,10 +923,11 @@
       "}" +
       "#" + REQUEST_EVENTS_TOP_ROW_ID + "{" +
       "display:flex!important;align-items:center!important;justify-content:flex-end!important;" +
-      "gap:8px!important;flex-wrap:wrap!important;min-width:0!important" +
+      "gap:10px!important;flex-wrap:nowrap!important;min-width:0!important;overflow-x:auto!important;" +
+      "padding-bottom:2px!important" +
       "}" +
       "#" + REQUEST_EVENTS_TOP_ROW_ID + ' [class*="UsagePage-module__requestEventsActions"]{' +
-      "display:flex!important;align-items:center!important;gap:8px!important;flex-wrap:wrap!important" +
+      "display:flex!important;align-items:center!important;gap:8px!important;flex-wrap:nowrap!important;flex:0 0 auto!important" +
       "}" +
       '[class*="UsagePage-module__requestEventsToolbar"]{' +
       "display:grid!important;grid-template-columns:repeat(4,minmax(120px,180px)) minmax(420px,1fr)!important;" +
@@ -717,7 +935,7 @@
       "}" +
       "#" + REQUEST_EVENTS_HEADER_CONTROLS_ID + "{" +
       "display:flex!important;align-items:center!important;justify-content:flex-end!important;" +
-      "gap:8px!important;flex-wrap:wrap!important;margin-left:0!important;min-width:0!important" +
+      "gap:8px!important;flex-wrap:nowrap!important;margin-left:0!important;min-width:0!important;flex:0 0 auto!important" +
       "}" +
       "#" + REQUEST_EVENTS_HEADER_CONTROLS_ID + ' [class*="UsagePage-module__timeRangeGroup"]{' +
       "margin-right:4px!important" +
@@ -729,8 +947,31 @@
       "min-width:0!important;width:100%!important" +
       "}" +
       '[class*="UsagePage-module__requestEventsTokenSummary"]{' +
-      "grid-column:auto!important;justify-self:stretch!important;margin-left:0!important;" +
-      "min-width:0!important;width:100%!important" +
+      "grid-column:auto!important;justify-self:end!important;margin-left:0!important;" +
+      "min-width:0!important;width:auto!important;flex:0 0 auto!important;white-space:nowrap!important;" +
+      "align-items:flex-end!important" +
+      "}" +
+      '[class*="UsagePage-module__requestEventsTokenSummaryGrid"]{' +
+      "grid-template-columns:repeat(4,minmax(72px,max-content))!important" +
+      "}" +
+      "#" + REQUEST_EVENTS_COPY_FALLBACK_ID + "{" +
+      "display:grid!important;grid-template-columns:auto minmax(0,1fr)!important;align-items:center!important;" +
+      "gap:8px!important;margin:0 0 8px!important;padding:8px 10px!important;border:1px solid var(--border-color)!important;" +
+      "border-radius:8px!important;background:var(--bg-secondary)!important;color:var(--text-secondary)!important;" +
+      "font-size:12px!important;max-width:100%!important;box-sizing:border-box!important" +
+      "}" +
+      "#" + REQUEST_EVENTS_COPY_FALLBACK_ID + " input{" +
+      "width:100%!important;min-width:0!important;box-sizing:border-box!important;border:1px solid var(--border-color)!important;" +
+      "border-radius:6px!important;background:var(--bg-primary)!important;color:var(--text-primary)!important;" +
+      "padding:6px 8px!important;font:inherit!important" +
+      "}" +
+      ".cliproxy-request-events-route #" + REQUEST_EVENTS_CARD_ID + " th:last-child," +
+      ".cliproxy-request-events-route #" + REQUEST_EVENTS_CARD_ID + " td:last-child{" +
+      "width:64px!important;min-width:64px!important;max-width:64px!important;text-align:center!important;" +
+      "white-space:nowrap!important;padding-left:6px!important;padding-right:6px!important" +
+      "}" +
+      ".cliproxy-request-events-route #" + REQUEST_EVENTS_CARD_ID + " td:last-child button{" +
+      "width:48px!important;padding-left:0!important;padding-right:0!important" +
       "}" +
       "#" + REQUEST_EVENTS_PAGER_ID + "{" +
       "display:flex!important;align-items:center!important;justify-content:space-between!important;" +
