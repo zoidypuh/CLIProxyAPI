@@ -131,7 +131,7 @@ func (l *Logger) LogRequest(url, method string, requestHeaders map[string][]stri
 			Body: map[string]any{
 				"id":          traceID,
 				"timestamp":   formatTime(requestTimestamp),
-				"name":        traceName(method, url),
+				"name":        traceName(method, url, requestHeaders, body, apiRequest),
 				"input":       input,
 				"output":      output,
 				"sessionId":   sessionID(requestHeaders, body),
@@ -406,7 +406,10 @@ func (w *streamingWriter) Close() error {
 	return w.logger.LogRequest(url, method, headers, body, statusCode, responseHeaders, response, nil, apiRequest, apiResponse, apiWebsocket, nil, requestID, start, time.Now())
 }
 
-func traceName(method, url string) string {
+func traceName(method, url string, headers map[string][]string, body []byte, apiRequest []byte) string {
+	if name := friendlyTraceName(headers, body, apiRequest); name != "" {
+		return name
+	}
 	method = strings.TrimSpace(method)
 	if method == "" {
 		method = "REQUEST"
@@ -416,6 +419,136 @@ func traceName(method, url string) string {
 		path = "/"
 	}
 	return "cliproxy " + method + " " + path
+}
+
+func friendlyTraceName(headers map[string][]string, body []byte, apiRequest []byte) string {
+	parts := make([]string, 0, 3)
+	if label := friendlySessionName(headers, body, apiRequest); label != "" {
+		parts = append(parts, label)
+	}
+	if model := modelFromPayload(body, apiRequest); model != "" {
+		parts = append(parts, model)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " / ")
+}
+
+func friendlySessionName(headers map[string][]string, body []byte, apiRequest []byte) string {
+	for _, key := range []string{"Authorization", "X-Api-Key", "Api-Key"} {
+		if value := localSessionLabel(firstHeader(headers, key)); value != "" {
+			return value
+		}
+	}
+	if label := displaySessionLabel(sessionID(headers, body)); label != "" {
+		return label
+	}
+	if provider := providerFromAPIRequest(apiRequest); provider != "" {
+		return provider
+	}
+	if userAgent := compactUserAgent(firstHeader(headers, "User-Agent")); userAgent != "" {
+		return userAgent
+	}
+	return ""
+}
+
+func localSessionLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		value = strings.TrimSpace(value[len("bearer "):])
+	}
+	if value == "" || looksTokenLike(value) {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	if strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
+		return ""
+	}
+	switch lower {
+	case "he...es":
+		return "hermes"
+	case "ho...ho":
+		return "honcho"
+	case "qw...te", "qwen...gate":
+		return "qwen-delegate"
+	default:
+		return value
+	}
+}
+
+func displaySessionLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if looksLikeUUID(value) {
+		return "codex"
+	}
+	return localSessionLabel(value)
+}
+
+func looksLikeUUID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 {
+		return false
+	}
+	for i, char := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func looksTokenLike(value string) bool {
+	stripped := strings.Join(strings.Fields(value), "")
+	lower := strings.ToLower(stripped)
+	return len(stripped) > 80 ||
+		strings.HasPrefix(lower, "eyj") ||
+		strings.HasPrefix(lower, "sk-") ||
+		strings.HasPrefix(lower, "sess-") ||
+		strings.HasPrefix(lower, "nvapi-") ||
+		strings.HasPrefix(lower, "aiza") ||
+		strings.HasPrefix(lower, "venice_") ||
+		strings.Count(stripped, ".") >= 2
+}
+
+func providerFromAPIRequest(apiRequest []byte) string {
+	text := string(apiRequest)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Auth:") {
+			continue
+		}
+		fields := strings.FieldsFunc(line, func(r rune) bool {
+			return r == ' ' || r == ',' || r == '\t'
+		})
+		for _, field := range fields {
+			if value, ok := strings.CutPrefix(field, "provider="); ok {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
+func compactUserAgent(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 52 {
+		return value
+	}
+	return value[:49] + "..."
 }
 
 func traceID(requestID string) string {

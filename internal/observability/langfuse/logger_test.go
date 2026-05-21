@@ -85,6 +85,9 @@ func TestLoggerLogRequestSendsLangfuseIngestion(t *testing.T) {
 	if traceBody["sessionId"] != "session-1" {
 		t.Fatalf("session id = %v", traceBody["sessionId"])
 	}
+	if traceBody["name"] != "session-1 / gpt-test" {
+		t.Fatalf("trace name = %v", traceBody["name"])
+	}
 
 	generation := batch[1].(map[string]any)
 	if generation["type"] != "generation-create" {
@@ -135,5 +138,36 @@ func TestLoggerDisabledWhenCredentialsMissing(t *testing.T) {
 	logger := NewLogger(config.LangfuseConfig{Enabled: true, BaseURL: "http://example.test"})
 	if logger.IsEnabled() {
 		t.Fatal("logger should be disabled without credentials")
+	}
+}
+
+func TestTraceNameUsesFriendlyLocalSessionWithoutLeakingTokens(t *testing.T) {
+	name := traceName(
+		http.MethodPost,
+		"/v1/responses",
+		map[string][]string{"Authorization": {"Bearer hermes"}},
+		[]byte(`{"model":"gpt-5.5"}`),
+		nil,
+	)
+	if name != "hermes / gpt-5.5" {
+		t.Fatalf("trace name = %q, want %q", name, "hermes / gpt-5.5")
+	}
+
+	name = traceName(
+		http.MethodPost,
+		"/v1/responses",
+		map[string][]string{"Authorization": {"Bearer sk-real-secret-token-that-should-not-be-used"}},
+		[]byte(`{"model":"gpt-5.5"}`),
+		nil,
+	)
+	if name != "gpt-5.5" {
+		t.Fatalf("trace name leaked or did not fall back to model: %q", name)
+	}
+}
+
+func TestTraceNameFallsBackToRouteWhenNoFriendlySessionOrModel(t *testing.T) {
+	name := traceName(http.MethodPost, "/v1/responses?api_key=masked", nil, nil, nil)
+	if name != "cliproxy POST /v1/responses" {
+		t.Fatalf("trace name = %q, want route fallback", name)
 	}
 }
