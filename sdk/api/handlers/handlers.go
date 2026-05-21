@@ -582,6 +582,11 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
 }
 
+// ExecuteImageWithAuthManager executes an OpenAI-compatible image endpoint request.
+func (h *BaseAPIHandler) ExecuteImageWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	return h.ExecuteWithAuthManager(ctx, handlerType, modelName, rawJSON, alt)
+}
+
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
@@ -806,6 +811,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+// ExecuteImageStreamWithAuthManager executes a streaming OpenAI-compatible image endpoint request.
+func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.ExecuteStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, alt)
 }
 
 func usageRequestedModel(modelName, normalizedModel string) string {

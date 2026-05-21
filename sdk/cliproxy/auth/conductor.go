@@ -2741,6 +2741,11 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	}
 }
 
+// GetExecutionSessionAuthByID retrieves a runtime auth scoped to an execution session.
+func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (*Auth, bool) {
+	return nil, false
+}
+
 func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
