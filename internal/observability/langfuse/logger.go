@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -179,6 +180,69 @@ func (l *Logger) LogStreamingRequest(url, method string, headers map[string][]st
 		start:      time.Now(),
 		statusCode: http.StatusOK,
 	}, nil
+}
+
+// HandleUsage emits Langfuse traces from the proxy usage stream. Codex websocket
+// requests publish usage records per turn, while the HTTP request logger only
+// completes when the long-lived websocket closes.
+func (l *Logger) HandleUsage(ctx context.Context, record coreusage.Record) {
+	if !l.IsEnabled() || !shouldCaptureUsageRecord(record) {
+		return
+	}
+	if record.RequestedAt.IsZero() {
+		record.RequestedAt = time.Now()
+	}
+	end := record.RequestedAt.Add(record.Latency)
+	if record.Latency <= 0 {
+		end = time.Now()
+	}
+	traceID := usageTraceID(record)
+	generationID := "cliproxy-usage-generation-" + uuid.NewString()
+	metadata := l.usageMetadata(record)
+	usage := usageFromRecord(record.Detail)
+	level := "DEFAULT"
+	if record.Failed {
+		level = "ERROR"
+	}
+
+	batch := []ingestionEvent{
+		{
+			ID:        uuid.NewString(),
+			Timestamp: formatTime(record.RequestedAt),
+			Type:      "trace-create",
+			Body: map[string]any{
+				"id":          traceID,
+				"timestamp":   formatTime(record.RequestedAt),
+				"name":        usageTraceName(record),
+				"sessionId":   emptyToNil(record.SessionID),
+				"release":     emptyToNil(l.release),
+				"environment": emptyToNil(l.environment),
+				"metadata":    metadata,
+				"tags":        []string{"cliproxy", "proxy", "usage", record.Provider},
+			},
+		},
+		{
+			ID:        uuid.NewString(),
+			Timestamp: formatTime(end),
+			Type:      "generation-create",
+			Body: map[string]any{
+				"id":          generationID,
+				"traceId":     traceID,
+				"name":        "cliproxy usage record",
+				"startTime":   formatTime(record.RequestedAt),
+				"endTime":     formatTime(end),
+				"model":       emptyToNil(record.Model),
+				"usage":       usage,
+				"metadata":    metadata,
+				"level":       level,
+				"environment": emptyToNil(l.environment),
+			},
+		},
+	}
+
+	if err := l.ingest(batch); err != nil {
+		log.WithError(err).Debug("langfuse usage ingestion failed")
+	}
 }
 
 func (l *Logger) ingest(batch []ingestionEvent) error {
@@ -625,6 +689,125 @@ func usageMap(result gjson.Result) map[string]any {
 		return nil
 	}
 	return usage
+}
+
+func shouldCaptureUsageRecord(record coreusage.Record) bool {
+	return strings.EqualFold(strings.TrimSpace(record.Provider), "codex")
+}
+
+func usageTraceID(record coreusage.Record) string {
+	requestID := strings.TrimSpace(record.RequestID)
+	if requestID != "" {
+		return "cliproxy-usage-" + requestID + "-" + fmt.Sprint(record.RequestedAt.UnixNano())
+	}
+	return "cliproxy-usage-" + uuid.NewString()
+}
+
+func usageTraceName(record coreusage.Record) string {
+	parts := make([]string, 0, 2)
+	if label := usageSessionLabel(record); label != "" {
+		parts = append(parts, label)
+	}
+	if model := strings.TrimSpace(record.Model); model != "" {
+		parts = append(parts, model)
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " / ")
+	}
+	return "cliproxy usage"
+}
+
+func usageSessionLabel(record coreusage.Record) string {
+	for _, value := range []string{record.APIKey, record.SessionID, record.Provider, record.Source} {
+		if label := displaySessionLabel(value); label != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+func usageFromRecord(detail coreusage.Detail) map[string]any {
+	usage := map[string]any{}
+	if detail.InputTokens != 0 {
+		usage["promptTokens"] = detail.InputTokens
+	}
+	if detail.OutputTokens != 0 {
+		usage["completionTokens"] = detail.OutputTokens
+	}
+	if detail.TotalTokens != 0 {
+		usage["totalTokens"] = detail.TotalTokens
+	}
+	if detail.CachedTokens != 0 {
+		usage["cachedTokens"] = detail.CachedTokens
+	}
+	if detail.CacheReadTokens != 0 {
+		usage["cacheReadTokens"] = detail.CacheReadTokens
+	}
+	if detail.CacheCreationTokens != 0 {
+		usage["cacheCreationTokens"] = detail.CacheCreationTokens
+	}
+	if detail.ReasoningTokens != 0 {
+		usage["reasoningTokens"] = detail.ReasoningTokens
+	}
+	if len(usage) == 0 {
+		return nil
+	}
+	return usage
+}
+
+func (l *Logger) usageMetadata(record coreusage.Record) map[string]any {
+	metadata := map[string]any{
+		"provider":         record.Provider,
+		"model":            record.Model,
+		"alias":            record.Alias,
+		"source":           record.Source,
+		"auth_id":          record.AuthID,
+		"auth_index":       record.AuthIndex,
+		"auth_type":        record.AuthType,
+		"session_id":       record.SessionID,
+		"request_id":       record.RequestID,
+		"log_file":         record.LogFile,
+		"reasoning_effort": record.ReasoningEffort,
+		"latency_ms":       record.Latency.Milliseconds(),
+		"failed":           record.Failed,
+	}
+	if record.APIKey != "" {
+		metadata["api_key"] = util.HideAPIKey(record.APIKey)
+	}
+	if record.Fail.StatusCode != 0 {
+		metadata["failure_status_code"] = record.Fail.StatusCode
+	}
+	if record.Fail.Body != "" {
+		metadata["failure_body"] = l.truncateString(record.Fail.Body)
+	}
+	if len(record.ResponseHeaders) > 0 {
+		metadata["response_headers"] = maskedHeaders(record.ResponseHeaders)
+	}
+	return compactMetadata(metadata)
+}
+
+func compactMetadata(metadata map[string]any) map[string]any {
+	out := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		switch v := value.(type) {
+		case string:
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+		case int64:
+			if v == 0 {
+				continue
+			}
+		case bool:
+			if !v {
+				continue
+			}
+		case nil:
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func levelForStatus(statusCode int, apiResponseErrors []*interfaces.ErrorMessage) string {

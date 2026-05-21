@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func TestLoggerLogRequestSendsLangfuseIngestion(t *testing.T) {
@@ -138,6 +139,108 @@ func TestLoggerDisabledWhenCredentialsMissing(t *testing.T) {
 	logger := NewLogger(config.LangfuseConfig{Enabled: true, BaseURL: "http://example.test"})
 	if logger.IsEnabled() {
 		t.Fatal("logger should be disabled without credentials")
+	}
+}
+
+func TestLoggerHandleUsageSendsCodexUsageRecord(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/public/ingestion" {
+			t.Fatalf("path = %s, want /api/public/ingestion", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"successes":[],"errors":[]}`))
+	}))
+	defer server.Close()
+
+	logger := NewLogger(config.LangfuseConfig{
+		Enabled:   true,
+		BaseURL:   server.URL,
+		PublicKey: "pk-lf-test",
+		SecretKey: "sk-lf-test",
+		MaxChars:  12000,
+	})
+	logger.HandleUsage(nil, coreusage.Record{
+		Provider:        "codex",
+		Model:           "gpt-5.5",
+		APIKey:          "codex",
+		AuthID:          "codex-user@example.test.json",
+		AuthIndex:       "7da50076c9dd84f8",
+		Source:          "codex-user@example.test.json",
+		SessionID:       "codex",
+		RequestID:       "req-1",
+		ReasoningEffort: "high",
+		RequestedAt:     time.Date(2026, 5, 21, 9, 10, 6, 0, time.UTC),
+		Latency:         6030 * time.Millisecond,
+		Detail: coreusage.Detail{
+			InputTokens:     145449,
+			OutputTokens:    185,
+			CachedTokens:    144768,
+			ReasoningTokens: 0,
+			TotalTokens:     145634,
+		},
+	})
+
+	batch, ok := gotPayload["batch"].([]any)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("batch = %#v, want 2 events", gotPayload["batch"])
+	}
+	trace := batch[0].(map[string]any)
+	traceBody := trace["body"].(map[string]any)
+	if traceBody["name"] != "codex / gpt-5.5" {
+		t.Fatalf("trace name = %v", traceBody["name"])
+	}
+	if traceBody["sessionId"] != "codex" {
+		t.Fatalf("session id = %v", traceBody["sessionId"])
+	}
+
+	generation := batch[1].(map[string]any)
+	generationBody := generation["body"].(map[string]any)
+	if generationBody["model"] != "gpt-5.5" {
+		t.Fatalf("generation model = %v", generationBody["model"])
+	}
+	usage := generationBody["usage"].(map[string]any)
+	if usage["promptTokens"].(float64) != 145449 ||
+		usage["completionTokens"].(float64) != 185 ||
+		usage["cachedTokens"].(float64) != 144768 ||
+		usage["totalTokens"].(float64) != 145634 {
+		t.Fatalf("usage = %#v", usage)
+	}
+	metadata := generationBody["metadata"].(map[string]any)
+	if metadata["auth_index"] != "7da50076c9dd84f8" || metadata["reasoning_effort"] != "high" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+	if strings.Contains(metadata["api_key"].(string), "codex") {
+		t.Fatalf("api key was not masked: %q", metadata["api_key"])
+	}
+}
+
+func TestLoggerHandleUsageIgnoresNonCodexUsageRecord(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	logger := NewLogger(config.LangfuseConfig{
+		Enabled:   true,
+		BaseURL:   server.URL,
+		PublicKey: "pk-lf-test",
+		SecretKey: "sk-lf-test",
+		MaxChars:  12000,
+	})
+	logger.HandleUsage(nil, coreusage.Record{
+		Provider: "openai",
+		Model:    "gpt-5.5",
+		APIKey:   "hermes",
+		Detail:   coreusage.Detail{InputTokens: 1, TotalTokens: 1},
+	})
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
 	}
 }
 

@@ -39,6 +39,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -64,7 +65,11 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
 	fileLogger := logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
-	return logging.NewCompositeRequestLogger(fileLogger, langfuseobs.NewLogger(cfg.Langfuse))
+	langfuseLogger := langfuseobs.NewLogger(cfg.Langfuse)
+	if langfuseLogger.IsEnabled() {
+		coreusage.RegisterPlugin(langfuseLogger)
+	}
+	return logging.NewCompositeRequestLogger(fileLogger, langfuseLogger)
 }
 
 // WithMiddleware appends additional Gin middleware during server construction.
