@@ -807,12 +807,12 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 			}
 		}
 
-		cooldownSuspended := 0
+		listableSuspended := 0
 		otherSuspended := 0
 		if registration.SuspendedClients != nil {
 			for _, reason := range registration.SuspendedClients {
-				if strings.EqualFold(reason, "quota") {
-					cooldownSuspended++
+				if modelSuspensionReasonIsListable(reason) {
+					listableSuspended++
 					continue
 				}
 				otherSuspended++
@@ -824,7 +824,7 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || listableSuspended > 0) && otherSuspended == 0) {
 			model := r.convertModelToMap(registration.Info, handlerType)
 			if model != nil {
 				models = append(models, model)
@@ -869,6 +869,15 @@ func cloneModelMapValue(value any) any {
 		return append([]string(nil), typed...)
 	default:
 		return value
+	}
+}
+
+func modelSuspensionReasonIsListable(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "quota", "unauthorized", "payment_required":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -943,7 +952,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 		registration, ok := r.models[modelID]
 
 		expiredClients := 0
-		cooldownSuspended := 0
+		listableSuspended := 0
 		otherSuspended := 0
 		if ok && registration != nil {
 			if registration.QuotaExceededClients != nil {
@@ -967,8 +976,8 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 					if p, okProvider := r.clientProviders[clientID]; !okProvider || p != provider {
 						continue
 					}
-					if strings.EqualFold(reason, "quota") {
-						cooldownSuspended++
+					if modelSuspensionReasonIsListable(reason) {
+						listableSuspended++
 						continue
 					}
 					otherSuspended++
@@ -982,7 +991,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 			effectiveClients = 0
 		}
 
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || listableSuspended > 0) && otherSuspended == 0) {
 			if entry.info != nil {
 				result = append(result, cloneModelInfo(entry.info))
 				continue

@@ -14,6 +14,9 @@ type requestIDKey struct{}
 // ginRequestIDKey is the Gin context key for request IDs.
 const ginRequestIDKey = "__request_id__"
 
+// ginRequestLogFileKey is the Gin context key for the expected request log filename.
+const ginRequestLogFileKey = "__request_log_file__"
+
 // GenerateRequestID creates a new 8-character hex request ID.
 func GenerateRequestID() string {
 	b := make([]byte, 4)
@@ -54,6 +57,26 @@ func GetGinRequestID(c *gin.Context) string {
 	}
 	if id, exists := c.Get(ginRequestIDKey); exists {
 		if s, ok := id.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// SetGinRequestLogFile stores the expected request log filename in the Gin context.
+func SetGinRequestLogFile(c *gin.Context, fileName string) {
+	if c != nil {
+		c.Set(ginRequestLogFileKey, fileName)
+	}
+}
+
+// GetGinRequestLogFile retrieves the expected request log filename from the Gin context.
+func GetGinRequestLogFile(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if fileName, exists := c.Get(ginRequestLogFileKey); exists {
+		if s, ok := fileName.(string); ok {
 			return s
 		}
 	}

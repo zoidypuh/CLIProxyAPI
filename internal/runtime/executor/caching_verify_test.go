@@ -256,3 +256,46 @@ func TestCacheControlOrder(t *testing.T) {
 
 	t.Log("cache order correct: tools -> system")
 }
+
+func TestPrependToFirstUserMessage_AddsCachedReminderBlockForArrayContent(t *testing.T) {
+	input := []byte(`{
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+		]
+	}`)
+
+	output := prependToFirstUserMessage(input, "stable reminder")
+
+	if got := gjson.GetBytes(output, "messages.0.content.0.type").String(); got != "text" {
+		t.Fatalf("messages.0.content.0.type = %q, want text", got)
+	}
+	if got := gjson.GetBytes(output, "messages.0.content.0.text").String(); got == "" || got == "Hello" {
+		t.Fatalf("messages.0.content.0.text should contain the prepended reminder, got %q", got)
+	}
+	if got := gjson.GetBytes(output, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("messages.0.content.0.cache_control.type = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(output, "messages.0.content.1.text").String(); got != "Hello" {
+		t.Fatalf("messages.0.content.1.text = %q, want Hello", got)
+	}
+}
+
+func TestPrependToFirstUserMessage_SplitsStringContentIntoCachedReminderAndUserText(t *testing.T) {
+	input := []byte(`{
+		"messages": [
+			{"role": "user", "content": "Hello"}
+		]
+	}`)
+
+	output := prependToFirstUserMessage(input, "stable reminder")
+
+	if got := gjson.GetBytes(output, "messages.0.content.#").Int(); got != 2 {
+		t.Fatalf("messages.0.content length = %d, want 2", got)
+	}
+	if got := gjson.GetBytes(output, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("messages.0.content.0.cache_control.type = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(output, "messages.0.content.1.text").String(); got != "Hello" {
+		t.Fatalf("messages.0.content.1.text = %q, want Hello", got)
+	}
+}

@@ -1,9 +1,12 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -16,21 +19,25 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.63 (external, cli)"
-	defaultClaudeFingerprintPackageVersion = "0.74.0"
+	defaultClaudeFingerprintVersion        = "2.1.124"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.124 (external, cli)"
+	defaultClaudeFingerprintPackageVersion = "0.81.0"
 	defaultClaudeFingerprintRuntimeVersion = "v24.3.0"
-	defaultClaudeFingerprintOS             = "MacOS"
-	defaultClaudeFingerprintArch           = "arm64"
+	defaultClaudeFingerprintOS             = "Linux"
+	defaultClaudeFingerprintArch           = "x64"
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
 	claudeDeviceProfileCleanupPeriod       = time.Hour
 )
 
 var (
 	claudeCLIVersionPattern = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
+	semanticVersionPattern  = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
 	claudeDeviceProfileCache            = make(map[string]claudeDeviceProfileCacheEntry)
 	claudeDeviceProfileCacheMu          sync.RWMutex
 	claudeDeviceProfileCacheCleanupOnce sync.Once
+	localClaudeVersionOnce              sync.Once
+	localClaudeVersionText              string
 
 	ClaudeDeviceProfileBeforeCandidateStore func(ClaudeDeviceProfile)
 )
@@ -91,6 +98,11 @@ func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Unlock()
 }
 
+func resetLocalClaudeVersionCacheForTest() {
+	localClaudeVersionOnce = sync.Once{}
+	localClaudeVersionText = ""
+}
+
 func MapStainlessOS() string {
 	return mapStainlessOS()
 }
@@ -112,8 +124,13 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		hd = cfg.ClaudeHeaderDefaults
 	}
 
+	defaultUserAgent := defaultClaudeFingerprintUserAgent
+	if version := strings.TrimSpace(hd.Version); version != "" && strings.TrimSpace(hd.UserAgent) == "" {
+		defaultUserAgent = "claude-cli/" + version + " (external, cli)"
+	}
+
 	profile := ClaudeDeviceProfile{
-		UserAgent:      hdrDefault(hd.UserAgent, defaultClaudeFingerprintUserAgent),
+		UserAgent:      hdrDefault(hd.UserAgent, defaultUserAgent),
 		PackageVersion: hdrDefault(hd.PackageVersion, defaultClaudeFingerprintPackageVersion),
 		RuntimeVersion: hdrDefault(hd.RuntimeVersion, defaultClaudeFingerprintRuntimeVersion),
 		OS:             hdrDefault(hd.OS, defaultClaudeFingerprintOS),
@@ -123,6 +140,76 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		profile.version = version
 		profile.hasVersion = true
 	}
+	profile = upgradeClaudeDeviceProfileFromLocalCLI(profile)
+	return profile
+}
+
+func localClaudeCodeVersion() string {
+	localClaudeVersionOnce.Do(func() {
+		if version := strings.TrimSpace(os.Getenv("CLAUDE_CODE_VERSION")); version != "" {
+			localClaudeVersionText = version
+			return
+		}
+		if strings.HasSuffix(os.Args[0], ".test") {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		out, err := exec.CommandContext(ctx, "claude", "--version").CombinedOutput()
+		if err != nil {
+			return
+		}
+		localClaudeVersionText = semanticVersionPattern.FindString(string(out))
+	})
+	return localClaudeVersionText
+}
+
+func parseClaudeVersionText(versionText string) (claudeCLIVersion, bool) {
+	matches := semanticVersionPattern.FindStringSubmatch(strings.TrimSpace(versionText))
+	if len(matches) != 4 {
+		return claudeCLIVersion{}, false
+	}
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	patch, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return claudeCLIVersion{}, false
+	}
+	return claudeCLIVersion{major: major, minor: minor, patch: patch}, true
+}
+
+func formatClaudeVersion(version claudeCLIVersion) string {
+	return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+}
+
+func upgradeClaudeDeviceProfileFromLocalCLI(profile ClaudeDeviceProfile) ClaudeDeviceProfile {
+	if profile.UserAgent != "" && !strings.HasPrefix(strings.TrimSpace(profile.UserAgent), "claude-cli/") {
+		return profile
+	}
+	if profile.UserAgent != "" && !profile.hasVersion {
+		return profile
+	}
+
+	version, ok := parseClaudeVersionText(localClaudeCodeVersion())
+	if !ok {
+		return profile
+	}
+	if profile.hasVersion && version.Compare(profile.version) <= 0 {
+		return profile
+	}
+
+	versionText := formatClaudeVersion(version)
+	profile.UserAgent = "claude-cli/" + versionText + " (external, cli)"
+	profile.version = version
+	profile.hasVersion = true
 	return profile
 }
 
@@ -358,14 +445,24 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
-// DefaultClaudeVersion returns the version string (e.g. "2.1.63") from the
-// current baseline device profile. It extracts the version from the User-Agent.
+// DefaultClaudeVersion returns the baseline device profile's parsed User-Agent
+// version, including any startup auto-upgrade from the local Claude CLI.
 func DefaultClaudeVersion(cfg *config.Config) string {
 	profile := defaultClaudeDeviceProfile(cfg)
-	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
-		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+	if cfg != nil {
+		if configuredVersion := strings.TrimSpace(cfg.ClaudeHeaderDefaults.Version); configuredVersion != "" {
+			profileVersion, profileOK := parseClaudeCLIVersion(profile.UserAgent)
+			configuredSemver, configuredOK := parseClaudeVersionText(configuredVersion)
+			if profileOK && configuredOK && profileVersion.Compare(configuredSemver) > 0 {
+				return formatClaudeVersion(profileVersion)
+			}
+			return configuredVersion
+		}
 	}
-	return "2.1.63"
+	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
+		return formatClaudeVersion(version)
+	}
+	return defaultClaudeFingerprintVersion
 }
 
 func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {

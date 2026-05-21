@@ -6,6 +6,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestPreservesPriorityServiceTier(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4",
+		"service_tier": "priority",
+		"messages": [
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", input, true)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("expected service_tier=priority, got %q", got)
+	}
+}
+
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
 // Expects developer msg + user msg + function_call + function_call_output.
 // No empty assistant message should appear between user and function_call.

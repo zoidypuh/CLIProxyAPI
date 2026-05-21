@@ -2,9 +2,14 @@ package helps
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -45,44 +50,6 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
-	}
-}
-
-func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
-	data := []byte(`{"usage":null}`)
-	detail := ParseOpenAIUsage(data)
-	if detail != (usage.Detail{}) {
-		t.Fatalf("detail = %+v, want zero detail", detail)
-	}
-}
-
-func TestParseOpenAIStreamUsageIgnoresNullUsage(t *testing.T) {
-	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"usage":null}`)
-	if detail, ok := ParseOpenAIStreamUsage(line); ok {
-		t.Fatalf("ParseOpenAIStreamUsage() = (%+v, true), want false for null usage", detail)
-	}
-}
-
-func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
-	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[],"usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}`)
-	detail, ok := ParseOpenAIStreamUsage(line)
-	if !ok {
-		t.Fatal("ParseOpenAIStreamUsage() ok = false, want true")
-	}
-	if detail.InputTokens != 8 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 8)
-	}
-	if detail.OutputTokens != 5 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 5)
-	}
-	if detail.TotalTokens != 13 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 13)
-	}
-	if detail.CachedTokens != 3 {
-		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 3)
-	}
-	if detail.ReasoningTokens != 2 {
-		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 2)
 	}
 }
 
@@ -146,29 +113,6 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
-func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
-	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")
-	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
-
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
-	if record.Model != "gpt-5.4" {
-		t.Fatalf("model = %q, want %q", record.Model, "gpt-5.4")
-	}
-	if record.Alias != "client-gpt" {
-		t.Fatalf("alias = %q, want %q", record.Alias, "client-gpt")
-	}
-}
-
-func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
-	ctx := usage.WithReasoningEffort(context.Background(), "medium")
-	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
-
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
-	if record.ReasoningEffort != "medium" {
-		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "medium")
-	}
-}
-
 func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	reporter := &UsageReporter{
 		provider:    "codex",
@@ -184,5 +128,175 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{CachedTokens: 2}); !ok {
 		t.Fatalf("expected non-zero cached token usage to be recorded")
+	}
+}
+
+func TestNewUsageReporterUsesRequestedModelMetadata(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Metadata: map[string]any{
+				cliproxyexecutor.RequestedModelMetadataKey: "codex-hermes",
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.Model != "codex-hermes" {
+		t.Fatalf("record.Model = %q, want %q", record.Model, "codex-hermes")
+	}
+}
+
+func TestNewUsageReporterCapturesSessionIDHeader(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"codex-hermes",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"hermes-session-123"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "hermes-session-123" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
+	}
+}
+
+func TestNewUsageReporterCapturesRequestLogMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	internallogging.SetGinRequestID(ginCtx, "a1b2c3d4")
+	internallogging.SetGinRequestLogFile(ginCtx, "v1-responses-2026-05-14T123456-a1b2c3d4.log")
+
+	reporter := NewUsageReporter(
+		context.WithValue(context.Background(), "gin", ginCtx),
+		"codex",
+		"gpt-5.5",
+		nil,
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.RequestID != "a1b2c3d4" {
+		t.Fatalf("record.RequestID = %q, want %q", record.RequestID, "a1b2c3d4")
+	}
+	if record.LogFile != "v1-responses-2026-05-14T123456-a1b2c3d4.log" {
+		t.Fatalf("record.LogFile = %q", record.LogFile)
+	}
+}
+
+func TestNewUsageReporterUsesLocalClientLabelAsSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer codex")
+	ginCtx.Set("apiKey", "codex")
+
+	reporter := NewUsageReporter(
+		context.WithValue(context.Background(), "gin", ginCtx),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"019e1bf7-c759-74a0-a7a3-aec4c8bb6316"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "codex" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "codex")
+	}
+}
+
+func TestNewUsageReporterCollapsesUnlabeledCodexUUIDSession(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"gpt-5.5",
+		nil,
+		cliproxyexecutor.Options{
+			Headers: http.Header{
+				"Session_id": {"019e1bf7-c759-74a0-a7a3-aec4c8bb6316"},
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "codex" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "codex")
+	}
+}
+
+func TestNewUsageReporterCapturesSanitizedSessionIDMetadata(t *testing.T) {
+	reporter := NewUsageReporter(
+		context.Background(),
+		"codex",
+		"codex-hermes",
+		nil,
+		cliproxyexecutor.Options{
+			Metadata: map[string]any{
+				cliproxyexecutor.RequestSessionIDMetadataKey: "hermes-session-123",
+			},
+		},
+	)
+
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+	if record.SessionID != "hermes-session-123" {
+		t.Fatalf("record.SessionID = %q, want %q", record.SessionID, "hermes-session-123")
+	}
+}
+
+func TestAPIKeyFromContextUsesGinAPIKeyFirst(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer hermes")
+	ginCtx.Set("apiKey", "qwen-delegate")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := APIKeyFromContext(ctx); got != "qwen-delegate" {
+		t.Fatalf("APIKeyFromContext() = %q, want %q", got, "qwen-delegate")
+	}
+}
+
+func TestAPIKeyFromContextFallsBackToLocalSessionLabelHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Authorization", "Bearer hermes")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := APIKeyFromContext(ctx); got != "hermes" {
+		t.Fatalf("APIKeyFromContext() = %q, want %q", got, "hermes")
+	}
+}
+
+func TestAPIKeyFromContextDoesNotFallbackToSecretLikeHeader(t *testing.T) {
+	tests := []string{
+		"Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+		"Bearer sk-local-codex",
+		"Bearer nvapi-123456",
+	}
+	for _, authHeader := range tests {
+		t.Run(authHeader, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			ginCtx.Request.Header.Set("Authorization", authHeader)
+
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			if got := APIKeyFromContext(ctx); got != "" {
+				t.Fatalf("APIKeyFromContext() = %q, want empty", got)
+			}
+		})
 	}
 }

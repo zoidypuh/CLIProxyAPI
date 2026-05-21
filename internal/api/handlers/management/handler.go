@@ -143,8 +143,7 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 }
 
 // Middleware enforces access control for management endpoints.
-// All requests (local and remote) require a valid management key.
-// Additionally, remote access requires allow-remote-management=true.
+// Local requests are allowed. Remote access requires allow-remote-management=true.
 func (h *Handler) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
@@ -153,32 +152,52 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
+		cfg := h.cfg
+		var (
+			allowRemote bool
+		)
+		if cfg != nil {
+			allowRemote = cfg.RemoteManagement.AllowRemote
+		}
 
-		// Accept either Authorization: Bearer <key> or X-Management-Key
-		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
-			parts := strings.SplitN(ah, " ", 2)
-			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-				provided = parts[1]
-			} else {
-				provided = ah
+		if !localClient {
+			h.attemptsMu.Lock()
+			ai := h.failedAttempts[clientIP]
+			if ai != nil {
+				if !ai.blockedUntil.IsZero() {
+					if time.Now().Before(ai.blockedUntil) {
+						remaining := time.Until(ai.blockedUntil).Round(time.Second)
+						h.attemptsMu.Unlock()
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)})
+						return
+					}
+					// Ban expired, reset state
+					ai.blockedUntil = time.Time{}
+					ai.count = 0
+				}
+			}
+			h.attemptsMu.Unlock()
+
+			if !allowRemote {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+				return
 			}
 		}
-		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
+
+		if !localClient {
+			h.attemptsMu.Lock()
+			if ai := h.failedAttempts[clientIP]; ai != nil {
+				ai.count = 0
+				ai.blockedUntil = time.Time{}
+			}
+			h.attemptsMu.Unlock()
 		}
 
-		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
-		if !allowed {
-			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
-			return
-		}
 		c.Next()
 	}
 }
 
-// AuthenticateManagementKey verifies the provided management key for the given client.
-// It mirrors the behaviour of Middleware() so non-HTTP callers can reuse the same logic.
+// AuthenticateManagementKey verifies the provided management key for non-HTTP callers.
 func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
 	const maxFailures = 5
 	const banDuration = 30 * time.Minute
@@ -210,7 +229,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 			h.attemptsMu.Unlock()
 			return false, http.StatusForbidden, fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)
 		}
-		// Ban expired, reset state
 		ai.blockedUntil = time.Time{}
 		ai.count = 0
 	}
@@ -245,7 +263,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		h.attemptsMu.Unlock()
 	}
 
-	if secretHash == "" && envSecret == "" {
+	if secretHash == "" && envSecret == "" && h.localPassword == "" {
 		return false, http.StatusForbidden, "remote management key not set"
 	}
 
@@ -274,7 +292,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	reset()
-
 	return true, 0, ""
 }
 
@@ -295,6 +312,13 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	return true
+}
+
+// saveConfigLocked saves the current in-memory config to disk without writing a response.
+func (h *Handler) saveConfigLocked() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return config.SaveConfigPreserveComments(h.configFilePath, h.cfg)
 }
 
 // Helper methods for simple types

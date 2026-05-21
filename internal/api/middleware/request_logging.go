@@ -141,13 +141,22 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
 	}
 
+	requestID := logging.GetGinRequestID(c)
+	timestamp := time.Now()
+	logFile := ""
+	if requestID != "" {
+		logFile = logging.RequestLogFileName(url, timestamp, requestID)
+		logging.SetGinRequestLogFile(c, logFile)
+	}
+
 	return &RequestInfo{
 		URL:       url,
 		Method:    method,
 		Headers:   headers,
 		Body:      body,
-		RequestID: logging.GetGinRequestID(c),
-		Timestamp: time.Now(),
+		RequestID: requestID,
+		LogFile:   logFile,
+		Timestamp: timestamp,
 	}, nil
 }
 

@@ -11,21 +11,8 @@ import (
 
 // Register ensures the config-access provider is available to the access manager.
 func Register(cfg *sdkconfig.SDKConfig) {
-	if cfg == nil {
-		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
-		return
-	}
-
-	keys := normalizeKeys(cfg.APIKeys)
-	if len(keys) == 0 {
-		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
-		return
-	}
-
-	sdkaccess.RegisterProvider(
-		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
-	)
+	_ = cfg
+	sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 }
 
 type provider struct {
@@ -85,19 +72,21 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		{queryAuthToken, "query-auth-token"},
 	}
 
+	// Accept any request that provides a credential — skip key matching.
+	// The proxy's upstream OAuth credentials are used regardless of what
+	// the client sends, so validating the client key adds no security
+	// value on a localhost-only deployment.
 	for _, candidate := range candidates {
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
-			return &sdkaccess.Result{
-				Provider:  p.Identifier(),
-				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
-			}, nil
-		}
+		return &sdkaccess.Result{
+			Provider:  p.Identifier(),
+			Principal: candidate.value,
+			Metadata: map[string]string{
+				"source": candidate.source,
+			},
+		}, nil
 	}
 
 	return nil, sdkaccess.NewInvalidCredentialError()

@@ -3,7 +3,6 @@ package diff
 import (
 	"fmt"
 	"net/url"
-	"reflect"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -97,12 +96,6 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}
 
-	// API keys (redacted) and counts
-	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {
-		changes = append(changes, fmt.Sprintf("api-keys count: %d -> %d", len(oldCfg.APIKeys), len(newCfg.APIKeys)))
-	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
-		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
-	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
 	} else {
@@ -248,12 +241,6 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.AmpCode.ForceModelMappings != newCfg.AmpCode.ForceModelMappings {
 		changes = append(changes, fmt.Sprintf("ampcode.force-model-mappings: %t -> %t", oldCfg.AmpCode.ForceModelMappings, newCfg.AmpCode.ForceModelMappings))
 	}
-	oldUpstreamAPIKeysCount := len(oldCfg.AmpCode.UpstreamAPIKeys)
-	newUpstreamAPIKeysCount := len(newCfg.AmpCode.UpstreamAPIKeys)
-	if !equalUpstreamAPIKeys(oldCfg.AmpCode.UpstreamAPIKeys, newCfg.AmpCode.UpstreamAPIKeys) {
-		changes = append(changes, fmt.Sprintf("ampcode.upstream-api-keys: updated (%d -> %d entries)", oldUpstreamAPIKeysCount, newUpstreamAPIKeysCount))
-	}
-
 	if entries, _ := DiffOAuthExcludedModelChanges(oldCfg.OAuthExcludedModels, newCfg.OAuthExcludedModels); len(entries) > 0 {
 		changes = append(changes, entries...)
 	}
@@ -276,17 +263,6 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldPanelRepo != newPanelRepo {
 		changes = append(changes, fmt.Sprintf("remote-management.panel-github-repository: %s -> %s", oldPanelRepo, newPanelRepo))
 	}
-	if oldCfg.RemoteManagement.SecretKey != newCfg.RemoteManagement.SecretKey {
-		switch {
-		case oldCfg.RemoteManagement.SecretKey == "" && newCfg.RemoteManagement.SecretKey != "":
-			changes = append(changes, "remote-management.secret-key: created")
-		case oldCfg.RemoteManagement.SecretKey != "" && newCfg.RemoteManagement.SecretKey == "":
-			changes = append(changes, "remote-management.secret-key: deleted")
-		default:
-			changes = append(changes, "remote-management.secret-key: updated")
-		}
-	}
-
 	// OpenAI compatibility providers (summarized)
 	if compat := DiffOpenAICompatibility(oldCfg.OpenAICompatibility, newCfg.OpenAICompatibility); len(compat) > 0 {
 		changes = append(changes, "openai-compatibility:")

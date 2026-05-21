@@ -1,0 +1,2619 @@
+#!/usr/bin/env python3
+"""Live-tail CLIProxyAPI request logs with Rich grouped output."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import colorsys
+import ctypes
+import ctypes.util
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import select
+import struct
+import sys
+import threading
+import time
+from typing import Any
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.text import Text
+except ModuleNotFoundError:
+    print("ERROR: rich is required. Install it with: python3 -m pip install --user rich", file=sys.stderr)
+    raise SystemExit(1)
+
+
+SECTION_RE = re.compile(r"^=== ([A-Z0-9 ]+) ===\s*$", re.M)
+REQUEST_LOG_RE = re.compile(r"^(v1|claude|gemini|codex|openai|anthropic)-")
+CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+DISPLAY_TZ = timezone(timedelta(hours=-3), "GMT-3")
+GPT55_INPUT_CREDITS_PER_1M = 125.0
+GPT55_CACHED_CREDITS_PER_1M = 12.5
+GPT55_OUTPUT_CREDITS_PER_1M = 750.0
+KNOWN_MASKED_SESSION_LABELS = {
+    "he...es": "hermes",
+    "ho...ho": "honcho",
+    "qw...te": "qwen-delegate",
+    "qwen...gate": "qwen-delegate",
+}
+
+
+@dataclass
+class TokenStats:
+    prompt: int | None = None
+    cached: int | None = None
+    output: int | None = None
+    reasoning: int | None = None
+    total: int | None = None
+
+
+@dataclass
+class RequestSummary:
+    path: Path
+    stamp: str
+    completed_at: datetime | None
+    completed_stamp: str
+    model: str
+    client: str
+    session: str
+    session_id: str
+    method: str
+    endpoint: str
+    message_count: int
+    status: str
+    duration: float | None
+    finish: str
+    upstream: str
+    provider: str
+    tokens: TokenStats
+    tokens_per_second: float | None
+
+    @property
+    def group_key(self) -> tuple[str, str]:
+        return (self.model or "unknown", self.session or self.client or "unknown")
+
+
+@dataclass
+class RequestPackage:
+    key: tuple[str, str]
+    first_summary: RequestSummary
+    last_summary: RequestSummary
+    count: int = 1
+    prompt: int | None = None
+    cached: int | None = None
+    output: int | None = None
+    reasoning: int | None = None
+    total: int | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_update_monotonic: float = 0.0
+
+
+@dataclass
+class UsageCalibrationState:
+    started_at: float | None = None
+    reset_at: float | None = None
+    baseline_used_percent: float | None = None
+    current_used_percent: float | None = None
+    fresh: int = 0
+    cached: int = 0
+    output: int = 0
+    reasoning: int = 0
+    total: int = 0
+
+
+@dataclass
+class ActiveRequest:
+    path: Path
+    first_seen_monotonic: float
+    last_size: int = -1
+    stable_checks: int = 0
+    missing_checks: int = 0
+    has_response: bool = False
+    summary: RequestSummary | None = None
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def default_base_url() -> str:
+    return os.environ.get("CLIPROXY_BASE_URL") or f"http://127.0.0.1:{os.environ.get('CLIPROXY_PORT', '8317')}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Live-tail CLIProxyAPI request logs with grouped Rich output.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=os.environ.get("CLIPROXY_LOG_DIR", str(Path.home() / ".cli-proxy-api" / "logs")),
+        help="Directory containing CLIProxyAPI request logs.",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=default_base_url(),
+        help="CLIProxyAPI base URL. Kept for compatibility; usage snapshots read auth files.",
+    )
+    parser.add_argument(
+        "--usage-interval",
+        type=int,
+        default=env_int("CLIPROXY_USAGE_INTERVAL", 0),
+        help="Deprecated; separate upstream usage snapshots are disabled.",
+    )
+    parser.add_argument(
+        "--auth-dir",
+        default=os.environ.get("CLIPROXY_AUTH_DIR", str(Path.home() / ".cli-proxy-api")),
+        help="Directory containing CLIProxyAPI auth files for usage snapshots.",
+    )
+    parser.add_argument(
+        "--codex-auth-file",
+        default=os.environ.get("CLIPROXY_CODEX_AUTH_FILE", ""),
+        help="Specific Codex auth JSON file for ChatGPT usage snapshots.",
+    )
+    parser.add_argument(
+        "--claude-auth-file",
+        default=os.environ.get("CLIPROXY_CLAUDE_AUTH_FILE", ""),
+        help="Specific Claude auth JSON file for Anthropic usage snapshots.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="Polling interval used when Linux inotify is unavailable.",
+    )
+    parser.add_argument(
+        "--watchdog-timeout",
+        type=float,
+        default=env_float("CLIPROXY_WATCHDOG_TIMEOUT", 45.0),
+        help="Restart the logger if the main loop does not heartbeat for this many seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--watchdog-check-interval",
+        type=float,
+        default=env_float("CLIPROXY_WATCHDOG_CHECK_INTERVAL", 5.0),
+        help="Seconds between watchdog checks.",
+    )
+    parser.add_argument(
+        "--max-active-display",
+        type=int,
+        default=env_int("CLIPROXY_MAX_ACTIVE_DISPLAY", 20),
+        help="Maximum active requests to show in the live status block.",
+    )
+    parser.add_argument(
+        "--package-window",
+        type=float,
+        default=env_float("CLIPROXY_PACKAGE_WINDOW", 2.5),
+        help="Seconds to aggregate adjacent completed requests with the same model and session. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--management-usage-interval",
+        type=float,
+        default=env_float("CLIPROXY_MANAGEMENT_USAGE_INTERVAL", 10.0),
+        help="Seconds between /v0/management/usage fallback polls for proxy request events. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--management-usage-stream",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("CLIPROXY_MANAGEMENT_USAGE_STREAM", "1").strip().lower() not in {"0", "false", "no"},
+        help="Prefer /v0/management/usage/events push stream when the proxy supports it.",
+    )
+    parser.add_argument(
+        "--footer-usage-interval",
+        type=float,
+        default=env_float("CLIPROXY_FOOTER_USAGE_INTERVAL", 30 * 60),
+        help="Seconds between bottom-line Codex 5h/weekly usage refreshes. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--initial",
+        type=int,
+        default=env_int("CLIPROXY_INITIAL_LOGS", 5),
+        help="Render this many existing completed request logs before watching. Use 0 to show only new logs.",
+    )
+    parser.add_argument(
+        "--rescan-interval",
+        type=float,
+        default=env_float("CLIPROXY_RESCAN_INTERVAL", 2.0),
+        help="Seconds between bounded log-dir rescans to catch already-open logs or missed watcher events. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--scan-limit",
+        type=int,
+        default=env_int("CLIPROXY_SCAN_LIMIT", 500),
+        help="Maximum newest request-log files considered during startup/rescan.",
+    )
+    parser.add_argument(
+        "--file",
+        action="append",
+        default=[],
+        help="Render an existing log file and exit. May be repeated.",
+    )
+    return parser.parse_args()
+
+
+def is_request_log(name: str) -> bool:
+    return bool(REQUEST_LOG_RE.match(name))
+
+
+def section(text: str, name: str, *, last: bool = False) -> str:
+    matches = [m for m in SECTION_RE.finditer(text) if m.group(1).strip() == name]
+    if not matches:
+        return ""
+    match = matches[-1] if last else matches[0]
+    start = match.end()
+    next_match = SECTION_RE.search(text, start)
+    end = next_match.start() if next_match else len(text)
+    return text[start:end].strip()
+
+
+def first_json(blob: str) -> dict[str, Any] | list[Any] | None:
+    blob = blob.strip()
+    if not blob:
+        return None
+
+    lines = blob.splitlines()
+    while lines and not lines[0].lstrip().startswith(("{", "[", "data:", "event:")):
+        lines.pop(0)
+    blob = "\n".join(lines).strip()
+
+    if blob.startswith("data:") or "\ndata:" in blob or blob.startswith("event:"):
+        return parse_sse_json(blob)
+
+    try:
+        return json.loads(blob)
+    except Exception:
+        pass
+
+    depth = 0
+    end = -1
+    for idx, char in enumerate(blob):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+    if end > 0:
+        try:
+            return json.loads(blob[:end])
+        except Exception:
+            return None
+    return None
+
+
+def websocket_event_json(text: str, event: str) -> dict[str, Any] | None:
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip() != f"Event: {event}":
+            continue
+        for raw in lines[idx + 1 :]:
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            if candidate.startswith(("Timestamp:", "Event:", "===")):
+                break
+            if not candidate.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def websocket_response_json(text: str) -> dict[str, Any] | None:
+    data_lines: list[str] = []
+    in_response = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line == "Event: websocket.response":
+            in_response = True
+            continue
+        if line.startswith("Event: ") or line.startswith("==="):
+            in_response = False
+        if in_response and line.startswith("{"):
+            data_lines.append(f"data: {line}")
+    if not data_lines:
+        return None
+    return parse_sse_json("\n".join(data_lines))
+
+
+def parse_sse_json(blob: str) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {
+        "usage": {},
+        "usageMetadata": {},
+        "choices": [{}],
+        "model": None,
+        "stop_reason": None,
+        "created_at": None,
+        "completed_at": None,
+    }
+
+    for line in blob.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        if obj.get("model"):
+            merged["model"] = obj["model"]
+
+        response_obj = obj.get("response")
+        if isinstance(response_obj, dict):
+            if response_obj.get("model"):
+                merged["model"] = response_obj["model"]
+            if response_obj.get("created_at") is not None:
+                merged["created_at"] = response_obj["created_at"]
+            if response_obj.get("completed_at") is not None:
+                merged["completed_at"] = response_obj["completed_at"]
+
+        choices = obj.get("choices") or []
+        if choices and isinstance(choices, list):
+            finish = choices[0].get("finish_reason")
+            if finish:
+                merged["choices"][0]["finish_reason"] = finish
+
+        if obj.get("stop_reason"):
+            merged["stop_reason"] = obj["stop_reason"]
+
+        delta = obj.get("delta")
+        if isinstance(delta, dict):
+            if delta.get("usage"):
+                usage = delta.get("usage")
+                if isinstance(usage, dict):
+                    merged["usage"].update(usage)
+            if delta.get("stop_reason"):
+                merged["stop_reason"] = delta["stop_reason"]
+
+        message = obj.get("message")
+        if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+            merged["usage"].update(message["usage"])
+
+        usage = obj.get("usage")
+        if not usage and isinstance(response_obj, dict):
+            usage = response_obj.get("usage")
+        if isinstance(usage, dict):
+            merged["usage"].update(usage)
+
+        usage_metadata = obj.get("usageMetadata") or obj.get("usage_metadata")
+        if not usage_metadata and isinstance(response_obj, dict):
+            usage_metadata = response_obj.get("usageMetadata") or response_obj.get("usage_metadata")
+        if isinstance(usage_metadata, dict):
+            merged["usageMetadata"].update(usage_metadata)
+
+    if (
+        merged["usage"]
+        or merged["usageMetadata"]
+        or merged["model"]
+        or merged["choices"][0].get("finish_reason")
+    ):
+        return merged
+    return None
+
+
+def parse_headers(blob: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for raw in blob.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key:
+            headers[key] = value
+    return headers
+
+
+def compact_user_agent(value: str) -> str:
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    if len(value) <= 52:
+        return value
+    return value[:49] + "..."
+
+
+def client_key(headers: dict[str, str]) -> str:
+    raw = headers.get("authorization") or headers.get("x-api-key") or headers.get("api-key") or ""
+    raw = raw.strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    return KNOWN_MASKED_SESSION_LABELS.get(raw.lower(), raw)
+
+
+def client_label_from_key(key: str) -> str:
+    key = re.sub(r"\s+", "", key or "")
+    if not key:
+        return ""
+    key_lower = key.lower()
+    if key_lower in {"codex", "co...ex"} or key_lower.endswith("odex"):
+        return "Codex CLI"
+    if key_lower in {"hermes", "he...es"} or key_lower.endswith("rmes"):
+        return "Hermes Agent"
+    if len(key) <= 6 or "..." in key:
+        return key
+    return ""
+
+
+def client_label(headers: dict[str, str]) -> str:
+    from_key = client_label_from_key(client_key(headers))
+    if from_key:
+        return from_key
+    return compact_user_agent(headers.get("user-agent", ""))
+
+
+def looks_like_uuid_session_id(value: str) -> bool:
+    return bool(re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        (value or "").strip(),
+        re.I,
+    ))
+
+
+def display_session_label(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if looks_like_uuid_session_id(value):
+        return "codex"
+    return KNOWN_MASKED_SESSION_LABELS.get(value.lower(), value)
+
+
+def extracted_session_id(
+    headers: dict[str, str],
+    api_headers: dict[str, str],
+    request_dict: dict[str, Any],
+) -> str:
+    for source in (headers, api_headers):
+        for key in ("session_id", "session-id", "x-session-id", "x-client-request-id", "conversation_id"):
+            value = source.get(key, "").strip()
+            if value:
+                return value
+    for key in ("session_id", "conversation_id", "prompt_cache_key", "previous_response_id"):
+        value = str(request_dict.get(key) or "").strip()
+        if value:
+            return value
+    metadata = request_dict.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("session_id", "conversation_id", "user_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def normalize_iso_timestamp(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"(\.\d{6})\d+([+-]\d\d:?\d\d|Z)?$", r"\1\2", value)
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return value
+
+
+def parse_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(normalize_iso_timestamp(value))
+    except Exception:
+        return None
+
+
+def display_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(DISPLAY_TZ)
+
+
+def comparable_datetime_pair(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    start_aware = start.tzinfo is not None and start.tzinfo.utcoffset(start) is not None
+    end_aware = end.tzinfo is not None and end.tzinfo.utcoffset(end) is not None
+    if start_aware == end_aware:
+        return start, end
+    if end_aware:
+        return start.replace(tzinfo=end.tzinfo), end
+    return start, end.replace(tzinfo=start.tzinfo)
+
+
+def response_duration_seconds(obj: Any) -> float | None:
+    if not isinstance(obj, dict):
+        return None
+    created = obj.get("created_at") or obj.get("created")
+    completed = obj.get("completed_at") or obj.get("completed")
+    if created is None or completed is None:
+        return None
+    try:
+        seconds = float(completed) - float(created)
+    except Exception:
+        return None
+    return seconds if seconds > 0 else None
+
+
+def as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def first_existing(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def parse_token_stats(obj: Any) -> TokenStats:
+    if not isinstance(obj, dict):
+        return TokenStats()
+
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    usage_metadata = first_existing(obj, "usageMetadata", "usage_metadata")
+    if not isinstance(usage_metadata, dict):
+        usage_metadata = {}
+
+    tokens = TokenStats()
+
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        tokens.prompt = as_int(usage.get("prompt_tokens"))
+        tokens.output = as_int(usage.get("completion_tokens"))
+        tokens.total = as_int(usage.get("total_tokens"))
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        if isinstance(prompt_details, dict):
+            tokens.cached = as_int(prompt_details.get("cached_tokens"))
+        if isinstance(completion_details, dict):
+            tokens.reasoning = as_int(completion_details.get("reasoning_tokens"))
+    elif "input_tokens" in usage or "output_tokens" in usage:
+        input_tokens = as_int(usage.get("input_tokens"))
+        cache_read = as_int(usage.get("cache_read_input_tokens")) or 0
+        cache_create = as_int(usage.get("cache_creation_input_tokens")) or 0
+        tokens.prompt = input_tokens
+        input_details = usage.get("input_tokens_details") or {}
+        if isinstance(input_details, dict):
+            tokens.cached = as_int(input_details.get("cached_tokens"))
+        if cache_read or cache_create:
+            tokens.prompt = (input_tokens or 0) + cache_read + cache_create
+            tokens.cached = cache_read or tokens.cached
+        tokens.output = as_int(usage.get("output_tokens"))
+        tokens.total = as_int(usage.get("total_tokens"))
+        output_details = usage.get("output_tokens_details") or {}
+        if isinstance(output_details, dict):
+            tokens.reasoning = as_int(output_details.get("reasoning_tokens"))
+    elif usage_metadata:
+        tokens.prompt = as_int(
+            first_existing(usage_metadata, "promptTokenCount", "prompt_token_count", "inputTokenCount")
+        )
+        tokens.output = as_int(
+            first_existing(usage_metadata, "candidatesTokenCount", "candidates_token_count", "outputTokenCount")
+        )
+        tokens.total = as_int(first_existing(usage_metadata, "totalTokenCount", "total_token_count"))
+        tokens.cached = as_int(
+            first_existing(usage_metadata, "cachedContentTokenCount", "cached_content_token_count")
+        )
+        tokens.reasoning = as_int(
+            first_existing(usage_metadata, "thoughtsTokenCount", "thoughts_token_count")
+        )
+
+    if tokens.total is None and tokens.prompt is not None and tokens.output is not None:
+        tokens.total = tokens.prompt + tokens.output
+    return tokens
+
+
+def has_tokens(tokens: TokenStats) -> bool:
+    return any(
+        value is not None
+        for value in (tokens.prompt, tokens.cached, tokens.output, tokens.reasoning, tokens.total)
+    )
+
+
+def parse_finish(resp: Any) -> str:
+    if not isinstance(resp, dict):
+        return ""
+    choices = resp.get("choices") or []
+    if choices and isinstance(choices, list) and isinstance(choices[0], dict):
+        finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
+        if finish:
+            return str(finish)
+    return str(resp.get("stop_reason") or "")
+
+
+def parse_log(path: Path) -> RequestSummary | None:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+
+    info = section(text, "REQUEST INFO")
+    ts_match = re.search(r"Timestamp:\s*([0-9T:\-\.\+Z]+)", info)
+    start_dt = parse_datetime(ts_match.group(1)) if ts_match else None
+    if start_dt is None:
+        start_dt = datetime.now(timezone.utc)
+    stamp = display_datetime(start_dt).strftime("%H:%M:%S")
+
+    method_match = re.search(r"Method:\s*(\S+)", info)
+    method = method_match.group(1) if method_match else ""
+
+    url_match = re.search(r"URL:\s*(\S+)", info)
+    endpoint = url_match.group(1) if url_match else path.name
+
+    request_json = first_json(section(text, "REQUEST BODY")) or websocket_event_json(text, "websocket.request")
+    headers = parse_headers(section(text, "HEADERS"))
+    response_text = section(text, "RESPONSE", last=True)
+    api_response_text = section(text, "API RESPONSE 1", last=True) or section(text, "API RESPONSE", last=True)
+    api_error_response_text = section(text, "API ERROR RESPONSE", last=True)
+    response_json = first_json(response_text)
+    api_response_json = first_json(api_response_text)
+    websocket_json = websocket_response_json(text)
+    parsed_response = response_json if response_json is not None else api_response_json or websocket_json
+
+    status_source = "\n".join(part for part in (response_text, api_response_text, api_error_response_text) if part)
+    status_match = re.search(r"\b(?:HTTP\s+)?Status:\s*(\d+)", status_source)
+    status = status_match.group(1) if status_match else ""
+
+    api_request = section(text, "API REQUEST 1")
+    upstream_match = re.search(r"Upstream URL:\s*(\S+)", api_request)
+    upstream_url = upstream_match.group(1) if upstream_match else ""
+    upstream = urlparse(upstream_url).netloc if upstream_url else ""
+    api_headers = parse_headers(api_request)
+
+    auth_match = re.search(r"Auth:\s*([^\n]+)", api_request)
+    auth = auth_match.group(1).strip() if auth_match else ""
+    provider_match = re.search(r"provider=([^,\s]+)", auth)
+    provider = provider_match.group(1) if provider_match else ""
+
+    resp_ts_match = re.search(r"Timestamp:\s*([0-9T:\-\.\+Z]+)", api_response_text or response_text)
+    duration = None
+    completed_at = None
+    if resp_ts_match:
+        end_dt = parse_datetime(resp_ts_match.group(1))
+        if end_dt is not None:
+            completed_at = end_dt
+            start_for_duration, end_for_duration = comparable_datetime_pair(start_dt, end_dt)
+            duration = max(0.0, (end_for_duration - start_for_duration).total_seconds())
+
+    if completed_at is None and status:
+        try:
+            completed_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            completed_at = None
+
+    generation_duration = response_duration_seconds(api_response_json) or response_duration_seconds(response_json)
+    if generation_duration is not None and (duration is None or generation_duration > duration):
+        duration = generation_duration
+
+    request_dict = request_json if isinstance(request_json, dict) else {}
+    response_dict = parsed_response if isinstance(parsed_response, dict) else {}
+    api_response_dict = api_response_json if isinstance(api_response_json, dict) else {}
+
+    model = (
+        request_dict.get("model")
+        or response_dict.get("model")
+        or api_response_dict.get("model")
+        or "unknown"
+    )
+    messages = request_dict.get("messages") or []
+    message_count = len(messages) if isinstance(messages, list) else 0
+
+    tokens = parse_token_stats(response_dict)
+    if not has_tokens(tokens):
+        tokens = parse_token_stats(api_response_dict)
+
+    output_tokens = tokens.output
+    tokens_per_second = None
+    if output_tokens is not None and duration and duration > 0:
+        tokens_per_second = output_tokens / duration
+
+    raw_client_key = client_key(headers)
+    client = client_label(headers)
+    return RequestSummary(
+        path=path,
+        stamp=stamp,
+        completed_at=completed_at,
+        completed_stamp=display_datetime(completed_at).strftime("%H:%M:%S") if completed_at else "",
+        model=str(model),
+        client=client,
+        session=raw_client_key or client or "unknown",
+        session_id=extracted_session_id(headers, api_headers, request_dict),
+        method=method,
+        endpoint=endpoint,
+        message_count=message_count,
+        status=status,
+        duration=duration,
+        finish=parse_finish(response_dict) or parse_finish(api_response_dict),
+        upstream=upstream,
+        provider=provider,
+        tokens=tokens,
+        tokens_per_second=tokens_per_second,
+    )
+
+
+def fmt_num(value: int | None) -> str:
+    return "-" if value is None else f"{value:,}"
+
+
+def fmt_duration(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value < 10:
+        return f"{value:.1f}s"
+    return f"{value:.0f}s"
+
+
+def fmt_rate(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value >= 100:
+        return f"{value:.0f}"
+    return f"{value:.1f}"
+
+
+def stable_style(name: str) -> str:
+    digest = hashlib.sha1(name.encode("utf-8", "replace")).digest()
+    hue = int.from_bytes(digest[:2], "big") / 65535
+    saturation = 0.68 + (digest[2] / 255) * 0.18
+    lightness = 0.58 + (digest[3] / 255) * 0.16
+    red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
+
+
+def status_style(status: str) -> str:
+    try:
+        code = int(status)
+    except ValueError:
+        return "bright_black"
+    if 200 <= code < 300:
+        return "bold green"
+    if 300 <= code < 400:
+        return "bold yellow"
+    return "bold red"
+
+
+def failed_summary(summary: RequestSummary) -> bool:
+    status = (summary.status or "").strip().lower()
+    if not status:
+        return False
+    if status in {"failed", "error"}:
+        return True
+    try:
+        code = int(status)
+    except ValueError:
+        return False
+    return code < 200 or code >= 400
+
+
+def request_display_style(summary: RequestSummary, fallback: str) -> str:
+    return "bold bright_white on red" if failed_summary(summary) else fallback
+
+
+def append_kv(text: Text, label: str, value: Any, value_style: str, *, pad: bool = True) -> None:
+    if value is None or value == "":
+        return
+    if pad and text.plain and not text.plain.endswith((" ", "─")):
+        text.append("  ")
+    text.append(f"{label}=", style="dim")
+    text.append(str(value), style=value_style)
+
+
+def fresh_tokens(tokens: TokenStats) -> int | None:
+    if tokens.prompt is None:
+        return None
+    if not tokens.cached:
+        return tokens.prompt
+    return max(0, tokens.prompt - tokens.cached)
+
+
+def high_input_no_cache(tokens: TokenStats) -> bool:
+    return tokens.prompt is not None and tokens.prompt > 10_000 and (tokens.cached or 0) < 1_000
+
+
+def cache_miss_detected(tokens: TokenStats) -> bool:
+    return high_input_no_cache(tokens)
+
+
+def compact_lines(summary: RequestSummary) -> tuple[str, str]:
+    tokens = summary.tokens
+    header = f"{summary.stamp or '-'}  {summary.model or 'unknown'}  session={summary.session or 'unknown'}"
+    values = [
+        ("fresh", fmt_num(fresh_tokens(tokens))),
+        ("output", fmt_num(tokens.output)),
+        ("cached", fmt_num(tokens.cached)),
+        ("total", fmt_num(tokens.total)),
+        ("tokens/s", fmt_rate(summary.tokens_per_second)),
+        ("duration", fmt_duration(summary.duration)),
+    ]
+    return header, "  ".join(f"{label}={value}" for label, value in values)
+
+
+def add_optional_int(left: int | None, right: int | None) -> int | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left + right
+
+
+def summary_started_at(summary: RequestSummary) -> datetime | None:
+    if summary.completed_at is None:
+        return None
+    if summary.duration is None:
+        return summary.completed_at
+    return summary.completed_at - timedelta(seconds=summary.duration)
+
+
+def request_fingerprint(summary: RequestSummary) -> tuple[Any, ...]:
+    tokens = summary.tokens
+    return (
+        summary.stamp or "",
+        summary.model or "unknown",
+        summary.session or summary.client or "unknown",
+        tokens.prompt,
+        tokens.cached or 0,
+        tokens.output,
+        tokens.reasoning,
+        tokens.total,
+    )
+
+
+def cache_miss_output_path(source: Path) -> Path:
+    return source.parent / "cache-miss" / f"{source.name}.txt"
+
+
+def named_log_output_path(summary: RequestSummary) -> Path:
+    source = summary.path
+    stamp = ""
+    if summary.completed_at is not None:
+        stamp = display_datetime(summary.completed_at).strftime("%Y%m%d-%H%M%S")
+    if not stamp:
+        stamp = re.sub(r"[^0-9A-Za-z]+", "", summary.stamp) or "unknown-time"
+
+    parts = [
+        stamp,
+        safe_filename_part(friendly_session_name(summary)),
+        safe_filename_part(summary.model or "unknown-model"),
+    ]
+    if summary.session_id:
+        parts.append(safe_filename_part(summary.session_id))
+    parts.append(hashlib.sha1(str(source).encode("utf-8", "replace")).hexdigest()[:8])
+    return source.parent / "by-session" / ("__".join(parts) + source.suffix)
+
+
+def friendly_session_name(summary: RequestSummary) -> str:
+    session = (summary.session or "").strip()
+    if session and not looks_token_like(session):
+        return session
+    if summary.provider:
+        return summary.provider
+    if summary.client and not looks_token_like(summary.client):
+        return summary.client
+    return "unknown-session"
+
+
+def looks_token_like(value: str) -> bool:
+    stripped = re.sub(r"\s+", "", value or "")
+    return (
+        len(stripped) > 80
+        or stripped.startswith(("eyJ", "sk-", "sess-"))
+        or stripped.count(".") >= 2
+    )
+
+
+def safe_filename_part(value: str, *, limit: int = 80) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.@+-]+", "-", value.strip())
+    cleaned = cleaned.strip("-._") or "unknown"
+    return cleaned[:limit]
+
+
+def marked_cache_miss(summary: RequestSummary) -> bool:
+    return (
+        cache_miss_detected(summary.tokens)
+        and (summary.session or "").strip().lower() == "hermes"
+        and (summary.model or "").strip() == "gpt-5.5"
+    )
+
+
+def write_cache_miss(summary: RequestSummary) -> Path | None:
+    if not marked_cache_miss(summary):
+        return None
+    if not summary.path.is_file():
+        return None
+    target = cache_miss_output_path(summary.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(summary.path.read_bytes())
+    return target
+
+
+def write_named_log_copy(summary: RequestSummary) -> Path | None:
+    if not summary.path.is_file():
+        return None
+    if summary.path.parent.name == "by-session":
+        return None
+    target = named_log_output_path(summary)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_bytes(summary.path.read_bytes())
+    return target
+
+
+def clamp_percent(value: float) -> float:
+    return max(0.0, min(100.0, value))
+
+
+def fmt_percent(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return f"{round(value):.0f}%"
+    return f"{value:.1f}%"
+
+
+def fmt_compact_count(value: float | int | None) -> str:
+    if value is None:
+        return "-"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+    if amount >= 1_000_000:
+        rendered = f"{amount / 1_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}M"
+    if amount >= 1_000:
+        rendered = f"{amount / 1_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}k"
+    return f"{sign}{amount:.0f}"
+
+
+def usage_window_label(seconds: int | None) -> str:
+    if not seconds or seconds <= 0:
+        return "window"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    hours = seconds / 3600
+    if hours >= 1:
+        return f"{hours:.1f}h"
+    return f"{seconds}s"
+
+
+def format_reset_time(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+
+    numeric = as_float(value)
+    if numeric is not None:
+        if numeric > 1_000_000_000_000:
+            numeric = numeric / 1000
+        try:
+            return datetime.fromtimestamp(numeric, tz=DISPLAY_TZ).strftime("%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    if isinstance(value, str):
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return display_datetime(parsed).strftime("%m-%d %H:%M")
+
+    return ""
+
+
+def fallback_reset_time(seconds: int | float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(time.time() + float(seconds), tz=DISPLAY_TZ).strftime("%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def usage_reset_epoch(window: dict[str, Any], fallback_seconds: int | None = None, *, now: float | None = None) -> float | None:
+    reset_at = first_existing(window, "reset_at", "resets_at", "resetAt", "resetsAt")
+    numeric = as_float(reset_at)
+    if numeric is not None:
+        if numeric > 1_000_000_000_000:
+            numeric = numeric / 1000
+        return numeric
+    if isinstance(reset_at, str):
+        parsed = parse_datetime(reset_at)
+        if parsed is not None:
+            return parsed.timestamp()
+
+    reset_after = as_float(first_existing(window, "reset_after_seconds", "resetAfterSeconds"))
+    if reset_after is not None and reset_after > 0:
+        return (now if now is not None else time.time()) + reset_after
+    if fallback_seconds and fallback_seconds > 0:
+        return (now if now is not None else time.time()) + float(fallback_seconds)
+    return None
+
+
+def usage_reset_label(window: dict[str, Any], fallback_seconds: int | None = None) -> str:
+    reset_at = first_existing(window, "reset_at", "resets_at", "resetAt", "resetsAt")
+    reset_label = format_reset_time(reset_at)
+    if reset_label:
+        return reset_label
+
+    reset_after = as_float(first_existing(window, "reset_after_seconds", "resetAfterSeconds"))
+    if reset_after is not None:
+        return fallback_reset_time(reset_after)
+
+    return fallback_reset_time(fallback_seconds)
+
+
+def with_reset_label(part: str, reset_label: str) -> str:
+    if reset_label:
+        return f"{part} ends {reset_label}"
+    return part
+
+
+def chatgpt_usage_left_part(window: Any) -> str | None:
+    if not isinstance(window, dict):
+        return None
+    used_percent = as_float(window.get("used_percent"))
+    if used_percent is None:
+        return None
+    left_percent = clamp_percent(100.0 - used_percent)
+    window_seconds = as_int(window.get("limit_window_seconds"))
+    label = usage_window_label(window_seconds)
+    part = f"{fmt_percent(left_percent)} / {label}"
+    return with_reset_label(part, usage_reset_label(window, window_seconds))
+
+
+def chatgpt_weekly_window(rate_limit: dict[str, Any]) -> dict[str, Any] | None:
+    windows = [
+        rate_limit.get("primary_window"),
+        rate_limit.get("secondary_window"),
+    ]
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        if usage_window_label(as_int(window.get("limit_window_seconds"))) == "7d":
+            return window
+    return None
+
+
+def chatgpt_usage_left_parts(usage: dict[str, Any]) -> list[str]:
+    rate_limit = usage.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return []
+    parts = [chatgpt_usage_left_part(chatgpt_weekly_window(rate_limit))]
+    return [part for part in parts if part]
+
+
+def short_limit_name(name: str) -> str:
+    cleaned = name.strip()
+    prefix = "GPT-5.3-Codex-"
+    if cleaned.startswith(prefix):
+        return cleaned.removeprefix(prefix)
+    return cleaned
+
+
+def chatgpt_usage_footer_parts(usage: dict[str, Any]) -> list[str]:
+    parts = chatgpt_usage_left_parts(usage)
+    additional = usage.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for item in additional:
+            if not isinstance(item, dict):
+                continue
+            rate_limit = item.get("rate_limit")
+            if not isinstance(rate_limit, dict):
+                continue
+            limit_name = short_limit_name(str(item.get("limit_name") or item.get("metered_feature") or "model"))
+            if limit_name.strip().lower() == "spark":
+                continue
+            part = chatgpt_usage_left_part(chatgpt_weekly_window(rate_limit))
+            if part:
+                parts.append(f"{limit_name} {part}")
+    return parts
+
+
+def anthropic_usage_left_part(window: Any, label: str) -> str | None:
+    if not isinstance(window, dict):
+        return None
+    used_percent = as_float(window.get("utilization"))
+    if used_percent is None:
+        return None
+    left_percent = clamp_percent(100.0 - used_percent)
+    fallback_seconds = {"5h": 5 * 3600, "7d": 7 * 86400}.get(label)
+    part = f"{fmt_percent(left_percent)} / {label}"
+    return with_reset_label(part, usage_reset_label(window, fallback_seconds))
+
+
+def anthropic_usage_left_parts(usage: dict[str, Any]) -> list[str]:
+    parts = [anthropic_usage_left_part(usage.get("seven_day"), "7d")]
+    return [part for part in parts if part]
+
+
+def usage_left_parts(upstream: str, usage: dict[str, Any]) -> list[str]:
+    if upstream == "anthropic":
+        return anthropic_usage_left_parts(usage)
+    return chatgpt_usage_left_parts(usage)
+
+
+class Gpt55UsagePacer:
+    def __init__(self) -> None:
+        self.state = UsageCalibrationState()
+
+    def observe_summary(self, summary: RequestSummary) -> None:
+        if not self.is_tracked_summary(summary):
+            return
+        tokens = summary.tokens
+        self.state.fresh += max(0, fresh_tokens(tokens) or 0)
+        self.state.cached += max(0, tokens.cached or 0)
+        self.state.output += max(0, tokens.output or 0)
+        self.state.reasoning += max(0, tokens.reasoning or 0)
+        self.state.total += max(0, tokens.total or 0)
+
+    def is_tracked_summary(self, summary: RequestSummary) -> bool:
+        return (
+            (summary.model or "").strip() == "gpt-5.5"
+            and not failed_summary(summary)
+            and has_tokens(summary.tokens)
+        )
+
+    def observe_chatgpt_usage(self, usage: dict[str, Any] | None, *, now: float | None = None) -> None:
+        if not isinstance(usage, dict):
+            return
+        rate_limit = usage.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            return
+        window = chatgpt_weekly_window(rate_limit)
+        if not isinstance(window, dict):
+            return
+        used_percent = as_float(window.get("used_percent"))
+        if used_percent is None:
+            return
+        reset_at = usage_reset_epoch(window, as_int(window.get("limit_window_seconds")), now=now)
+        now_value = now if now is not None else time.time()
+        reset_moved = (
+            self.state.reset_at is not None
+            and reset_at is not None
+            and abs(reset_at - self.state.reset_at) > 300
+            and (
+                self.state.current_used_percent is None
+                or used_percent <= self.state.current_used_percent
+            )
+        )
+        if (
+            self.state.baseline_used_percent is None
+            or used_percent + 0.1 < self.state.baseline_used_percent
+            or reset_moved
+        ):
+            self.state = UsageCalibrationState(
+                started_at=now_value,
+                reset_at=reset_at,
+                baseline_used_percent=used_percent,
+                current_used_percent=used_percent,
+            )
+            return
+        self.state.current_used_percent = used_percent
+        if reset_at is not None:
+            self.state.reset_at = reset_at
+        if self.state.started_at is None:
+            self.state.started_at = now_value
+
+    def observed_credits(self) -> float:
+        return (
+            self.state.fresh * GPT55_INPUT_CREDITS_PER_1M
+            + self.state.cached * GPT55_CACHED_CREDITS_PER_1M
+            + self.state.output * GPT55_OUTPUT_CREDITS_PER_1M
+        ) / 1_000_000
+
+    def percent_delta(self) -> float | None:
+        if self.state.baseline_used_percent is None or self.state.current_used_percent is None:
+            return None
+        return max(0.0, self.state.current_used_percent - self.state.baseline_used_percent)
+
+    def credits_per_percent(self) -> float | None:
+        delta = self.percent_delta()
+        credits = self.observed_credits()
+        if delta is None or delta < 0.05 or credits <= 0:
+            return None
+        return credits / delta
+
+    def equivalent_tokens_per_percent(self) -> tuple[float, float, float] | None:
+        credits = self.credits_per_percent()
+        if credits is None:
+            return None
+        return (
+            credits * 1_000_000 / GPT55_INPUT_CREDITS_PER_1M,
+            credits * 1_000_000 / GPT55_CACHED_CREDITS_PER_1M,
+            credits * 1_000_000 / GPT55_OUTPUT_CREDITS_PER_1M,
+        )
+
+    def status_text(self, *, now: float | None = None) -> str:
+        now_value = now if now is not None else time.time()
+        if self.state.baseline_used_percent is None or self.state.current_used_percent is None:
+            return "calibrating: waiting for ChatGPT usage %"
+        if self.state.fresh + self.state.cached + self.state.output <= 0:
+            return "calibrating: waiting for gpt-5.5 token events"
+        equivalents = self.equivalent_tokens_per_percent()
+        if equivalents is None:
+            return "calibrating: waiting for usage % movement"
+
+        remaining_percent = clamp_percent(100.0 - self.state.current_used_percent)
+        hours_left = None
+        if self.state.reset_at is not None:
+            hours_left = max(0.0, (self.state.reset_at - now_value) / 3600)
+        need_per_hour = remaining_percent / hours_left if hours_left and hours_left > 0 else None
+
+        pace_part = "pace=calibrating"
+        delta = self.percent_delta() or 0.0
+        if self.state.started_at is not None and self.state.reset_at is not None:
+            elapsed = max(0.0, now_value - self.state.started_at)
+            total = max(0.0, self.state.reset_at - self.state.started_at)
+            available = clamp_percent(100.0 - self.state.baseline_used_percent)
+            target_delta = available * (elapsed / total) if total > 0 else 0.0
+            if target_delta > 0.05:
+                ratio = delta / target_delta
+                if ratio > 1.10:
+                    pace_state = "fast"
+                elif ratio < 0.90:
+                    pace_state = "slow"
+                else:
+                    pace_state = "on"
+                pace_part = f"pace={pace_state} {ratio:.2f}x"
+
+        fresh_per_percent, cached_per_percent, output_per_percent = equivalents
+        parts = [
+            pace_part,
+            f"1%≈{fmt_compact_count(fresh_per_percent)} fresh/{fmt_compact_count(cached_per_percent)} cached/{fmt_compact_count(output_per_percent)} out",
+            f"left≈{fmt_compact_count(fresh_per_percent * remaining_percent)} fresh/{fmt_compact_count(output_per_percent * remaining_percent)} out",
+        ]
+        if need_per_hour is not None:
+            parts.insert(1, f"need={need_per_hour:.2f}%/h")
+            parts.append(
+                f"need/h≈{fmt_compact_count(fresh_per_percent * need_per_hour)} fresh/{fmt_compact_count(output_per_percent * need_per_hour)} out"
+            )
+        return "; ".join(parts)
+
+
+def footer_usage_text(
+    snapshot: tuple[str, dict[str, Any] | None, str | None] | None,
+    usage_pacer: Gpt55UsagePacer | None = None,
+) -> Text:
+    text = Text()
+    if snapshot is None:
+        return text
+
+    upstream, usage, error = snapshot
+    text.append("◇ USAGE", style="bold bright_white")
+    text.append("  ")
+    text.append(upstream.upper(), style="bold bright_cyan")
+    if error:
+        text.append("  unavailable=", style="dim")
+        text.append(error, style="red")
+        return text
+    if not usage:
+        text.append("  unavailable", style="red")
+        return text
+
+    if upstream == "chatgpt":
+        parts = chatgpt_usage_footer_parts(usage)
+    else:
+        parts = usage_left_parts(upstream, usage)
+    if not parts:
+        text.append("  unavailable=missing-windows", style="red")
+        return text
+    text.append("  left ", style="dim")
+    text.append(", ".join(parts), style="bold bright_yellow")
+    if upstream == "chatgpt" and usage_pacer is not None:
+        text.append("\n  GPT-5.5 ", style="dim")
+        text.append(usage_pacer.status_text(), style="bold bright_magenta")
+    return text
+
+
+def decode_jwt_payload(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        obj = json.loads(decoded.decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def id_token_account_id(raw: Any) -> str:
+    obj: dict[str, Any]
+    if isinstance(raw, dict):
+        obj = raw
+    elif isinstance(raw, str):
+        obj = decode_jwt_payload(raw)
+    else:
+        return ""
+
+    auth_claim = obj.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        account_id = auth_claim.get("chatgpt_account_id")
+        if account_id:
+            return str(account_id)
+    account_id = obj.get("chatgpt_account_id")
+    return str(account_id) if account_id else ""
+
+
+def auth_priority(auth: dict[str, Any]) -> int:
+    value = auth.get("priority")
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def codex_auth_candidates(auth_dir: str, auth_file: str) -> list[Path]:
+    if auth_file:
+        return [Path(auth_file).expanduser()]
+    root = Path(auth_dir).expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(root.glob("codex-*.json"))
+
+
+def claude_auth_candidates(auth_dir: str, auth_file: str) -> list[Path]:
+    if auth_file:
+        return [Path(auth_file).expanduser()]
+    root = Path(auth_dir).expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(root.glob("claude-*.json"))
+
+
+def management_usage_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/v0/management/usage"
+
+
+def management_usage_events_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/v0/management/usage/events"
+
+
+def fetch_management_usage(base_url: str) -> tuple[dict[str, Any] | None, str | None]:
+    req = urllib.request.Request(management_usage_url(base_url), headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        return None, str(reason or exc.__class__.__name__)
+    except OSError as exc:
+        return None, exc.__class__.__name__
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None, "bad-json"
+    except Exception as exc:
+        return None, exc.__class__.__name__
+    if not isinstance(parsed, dict):
+        return None, "bad-response"
+    return parsed, None
+
+
+def stream_management_usage_events(
+    base_url: str,
+    event_queue: "queue.Queue[tuple[str, Any]]",
+    stop_event: threading.Event,
+) -> None:
+    req = urllib.request.Request(
+        management_usage_events_url(base_url),
+        headers={"Accept": "text/event-stream"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            event_name = "message"
+            data_lines: list[str] = []
+            while not stop_event.is_set():
+                raw_line = resp.readline()
+                if raw_line == b"":
+                    event_queue.put(("stream_error", "closed"))
+                    return
+                line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                if not line:
+                    if data_lines:
+                        payload = "\n".join(data_lines)
+                        if event_name in {"message", "usage"}:
+                            try:
+                                event_queue.put(("usage_event", json.loads(payload)))
+                            except json.JSONDecodeError:
+                                event_queue.put(("stream_error", "bad-json"))
+                                return
+                    event_name = "message"
+                    data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_name = line.split(":", 1)[1].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line.split(":", 1)[1].lstrip())
+    except urllib.error.HTTPError as exc:
+        event_queue.put(("stream_error", f"HTTP {exc.code}"))
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        event_queue.put(("stream_error", str(reason or exc.__class__.__name__)))
+    except OSError as exc:
+        event_queue.put(("stream_error", exc.__class__.__name__))
+
+
+def detail_tokens(detail: dict[str, Any]) -> TokenStats:
+    tokens_raw = detail.get("tokens")
+    tokens_map = tokens_raw if isinstance(tokens_raw, dict) else {}
+    tokens = TokenStats(
+        prompt=as_int(tokens_map.get("input_tokens")),
+        cached=as_int(tokens_map.get("cached_tokens")),
+        output=as_int(tokens_map.get("output_tokens")),
+        reasoning=as_int(tokens_map.get("reasoning_tokens")),
+        total=as_int(tokens_map.get("total_tokens")),
+    )
+    if detail.get("failed") and all(value in (None, 0) for value in (tokens.prompt, tokens.cached, tokens.output, tokens.reasoning, tokens.total)):
+        return TokenStats()
+    return tokens
+
+
+def usage_event_key(api_key: str, model: str, detail: dict[str, Any]) -> tuple[Any, ...]:
+    tokens = detail_tokens(detail)
+    return (
+        detail.get("timestamp") or "",
+        api_key,
+        model,
+        detail.get("latency_ms") or 0,
+        tokens.prompt,
+        tokens.cached,
+        tokens.output,
+        tokens.reasoning,
+        tokens.total,
+        bool(detail.get("failed")),
+    )
+
+
+def usage_summary_path(log_dir: Path, key: tuple[Any, ...]) -> Path:
+    raw_stamp = re.sub(r"[^0-9A-Za-z]+", "", str(key[0]))[:20] or "unknown-time"
+    digest = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()[:8]
+    return log_dir / f"usage-{raw_stamp}-{digest}.txt"
+
+
+def usage_detail_session(aggregate_api_key: str, detail: dict[str, Any]) -> str:
+    api_key = str(detail.get("api_key") or "").strip()
+    aggregate = str(aggregate_api_key or "").strip()
+    session_id = str(detail.get("session_id") or detail.get("sessionId") or detail.get("SessionID") or "").strip()
+    if session_id and (not api_key or looks_like_route_identifier(api_key) or looks_like_route_identifier(aggregate)):
+        return display_session_label(session_id) or "unknown"
+    value = api_key or aggregate
+    if looks_like_route_identifier(value) and session_id:
+        return display_session_label(session_id) or "unknown"
+    return display_session_label(value) or "unknown"
+
+
+def looks_like_route_identifier(value: str) -> bool:
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    return bool(re.match(r"^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+/", value))
+
+
+def usage_detail_summary(log_dir: Path, aggregate_api_key: str, model: str, detail: dict[str, Any]) -> RequestSummary | None:
+    if not isinstance(detail, dict):
+        return None
+    timestamp = parse_datetime(str(detail.get("timestamp") or ""))
+    if timestamp is None:
+        return None
+    latency_ms = as_float(detail.get("latency_ms"))
+    duration = latency_ms / 1000.0 if latency_ms is not None else None
+    tokens = detail_tokens(detail)
+    tokens_per_second = None
+    if tokens.output is not None and duration and duration > 0:
+        tokens_per_second = tokens.output / duration
+    key = usage_event_key(aggregate_api_key, model, detail)
+    session = usage_detail_session(aggregate_api_key, detail)
+    failed = bool(detail.get("failed"))
+    if looks_like_route_identifier(session) or (not has_tokens(tokens) and not failed):
+        return None
+    endpoint = aggregate_api_key if "/" in aggregate_api_key else ""
+    method = ""
+    if endpoint:
+        parts = endpoint.split(None, 1)
+        if len(parts) == 2:
+            method, endpoint = parts
+    completed_at = timestamp + timedelta(seconds=duration or 0)
+    return RequestSummary(
+        path=usage_summary_path(log_dir, key),
+        stamp=display_datetime(timestamp).strftime("%H:%M:%S"),
+        completed_at=completed_at,
+        completed_stamp=display_datetime(completed_at).strftime("%H:%M:%S"),
+        model=str(model or "unknown"),
+        client=str(detail.get("source") or ""),
+        session=session,
+        session_id=str(detail.get("session_id") or ""),
+        method=method,
+        endpoint=endpoint,
+        message_count=0,
+        status="failed" if failed else "",
+        duration=duration,
+        finish="",
+        upstream="",
+        provider="",
+        tokens=tokens,
+        tokens_per_second=tokens_per_second,
+    )
+
+
+def usage_summaries(snapshot: dict[str, Any], log_dir: Path) -> list[tuple[tuple[Any, ...], RequestSummary]]:
+    usage = snapshot.get("usage") if isinstance(snapshot, dict) else None
+    apis = usage.get("apis") if isinstance(usage, dict) else None
+    if not isinstance(apis, dict):
+        return []
+    summaries: list[tuple[tuple[Any, ...], RequestSummary]] = []
+    for aggregate_api_key, api_snapshot in apis.items():
+        if not isinstance(api_snapshot, dict):
+            continue
+        models = api_snapshot.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model, model_snapshot in models.items():
+            if not isinstance(model_snapshot, dict):
+                continue
+            details = model_snapshot.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                key = usage_event_key(str(aggregate_api_key), str(model), detail)
+                summary = usage_detail_summary(log_dir, str(aggregate_api_key), str(model), detail)
+                if summary is not None:
+                    summaries.append((key, summary))
+    summaries.sort(key=lambda item: (item[1].completed_at or datetime.min.replace(tzinfo=timezone.utc), repr(item[0])))
+    return summaries
+
+
+def usage_event_summary(event: dict[str, Any], log_dir: Path) -> tuple[tuple[Any, ...], RequestSummary] | None:
+    if not isinstance(event, dict):
+        return None
+    aggregate_api_key = str(event.get("api_key") or "")
+    model = str(event.get("model") or "unknown")
+    detail = event.get("detail")
+    if not isinstance(detail, dict):
+        return None
+    key = usage_event_key(aggregate_api_key, model, detail)
+    summary = usage_detail_summary(log_dir, aggregate_api_key, model, detail)
+    if summary is None:
+        return None
+    return key, summary
+
+
+def load_chatgpt_auth(auth_dir: str, auth_file: str) -> tuple[str, str, str | None]:
+    candidates: list[tuple[int, str, str]] = []
+    saw_codex = False
+    for path in codex_auth_candidates(auth_dir, auth_file):
+        try:
+            obj = json.loads(path.read_text(errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "codex" and not path.name.startswith("codex-"):
+            continue
+        saw_codex = True
+        if obj.get("disabled") is True or obj.get("expired") is True:
+            continue
+        token = obj.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            continue
+        account_id = obj.get("account_id")
+        if not account_id:
+            account_id = id_token_account_id(obj.get("id_token"))
+        candidates.append((auth_priority(obj), token.strip(), str(account_id or "")))
+
+    if not candidates:
+        return "", "", "no-access-token" if saw_codex else "no-codex-auth"
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, token, account_id = candidates[0]
+    return token, account_id, None
+
+
+def load_anthropic_auth(auth_dir: str, auth_file: str) -> tuple[str, str | None]:
+    saw_claude = False
+    for path in claude_auth_candidates(auth_dir, auth_file):
+        try:
+            obj = json.loads(path.read_text(errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "claude" and not path.name.startswith("claude-"):
+            continue
+        saw_claude = True
+        if obj.get("disabled") is True or obj.get("expired") is True:
+            continue
+        token = obj.get("access_token")
+        if isinstance(token, str) and token.strip():
+            return token.strip(), None
+    return "", "no-access-token" if saw_claude else "no-claude-auth"
+
+
+class GroupedRenderer:
+    def __init__(self, console: Console, package_window: float = 2.5) -> None:
+        self.console = console
+        self.current_key: tuple[str, str] | None = None
+        self.current_style = ""
+        self.open_group = False
+        self.rendered_requests = 0
+        self.package_window = max(0.0, package_window)
+        self.pending_package: RequestPackage | None = None
+
+    def close_group(self) -> None:
+        if self.open_group:
+            self.console.print(Text("╰─", style=self.current_style), soft_wrap=True)
+            self.open_group = False
+
+    def separate_from_request_group(self, *, blank: bool = True) -> None:
+        self.flush_package()
+        if self.current_key is None:
+            return
+        self.close_group()
+        if blank:
+            self.console.print()
+        self.current_key = None
+        self.current_style = ""
+
+    def render_request(self, summary: RequestSummary) -> None:
+        if self.should_package(summary):
+            self.add_to_package(summary)
+            return
+        self.flush_package()
+        self.render_single_request(summary)
+
+    def render_single_request(self, summary: RequestSummary) -> None:
+        key = summary.group_key
+        style = stable_style("\0".join(key))
+        display_style = request_display_style(summary, style)
+        if self.rendered_requests:
+            self.console.print()
+        self.console.print(self.compact_header_line(summary, display_style), soft_wrap=True)
+        self.console.print(self.compact_token_line(summary, display_style), soft_wrap=True)
+        self.rendered_requests += 1
+
+    def should_package(self, summary: RequestSummary) -> bool:
+        return self.package_window > 0 and not failed_summary(summary)
+
+    def package_gap(self, package: RequestPackage, summary: RequestSummary) -> float | None:
+        start = summary_started_at(summary) or summary.completed_at
+        if package.started_at is None or start is None:
+            return None
+        return abs((start - package.started_at).total_seconds())
+
+    def can_extend_package(self, summary: RequestSummary) -> bool:
+        package = self.pending_package
+        if package is None:
+            return False
+        if package.key != summary.group_key:
+            return False
+        gap = self.package_gap(package, summary)
+        return gap is None or gap <= self.package_window
+
+    def new_package(self, summary: RequestSummary) -> RequestPackage:
+        tokens = summary.tokens
+        started_at = summary_started_at(summary) or summary.completed_at
+        return RequestPackage(
+            key=summary.group_key,
+            first_summary=summary,
+            last_summary=summary,
+            prompt=tokens.prompt,
+            cached=tokens.cached,
+            output=tokens.output,
+            reasoning=tokens.reasoning,
+            total=tokens.total,
+            started_at=started_at,
+            completed_at=summary.completed_at,
+            last_update_monotonic=time.monotonic(),
+        )
+
+    def add_to_package(self, summary: RequestSummary) -> None:
+        if not self.can_extend_package(summary):
+            self.flush_package()
+            self.pending_package = self.new_package(summary)
+            return
+        package = self.pending_package
+        if package is None:
+            self.pending_package = self.new_package(summary)
+            return
+        tokens = summary.tokens
+        package.count += 1
+        package.last_summary = summary
+        package.prompt = add_optional_int(package.prompt, tokens.prompt)
+        package.cached = add_optional_int(package.cached, tokens.cached)
+        package.output = add_optional_int(package.output, tokens.output)
+        package.reasoning = add_optional_int(package.reasoning, tokens.reasoning)
+        package.total = add_optional_int(package.total, tokens.total)
+        started_at = summary_started_at(summary) or summary.completed_at
+        if started_at is not None and (package.started_at is None or started_at < package.started_at):
+            package.started_at = started_at
+        if summary.completed_at is not None and (package.completed_at is None or summary.completed_at > package.completed_at):
+            package.completed_at = summary.completed_at
+        package.last_update_monotonic = time.monotonic()
+
+    def flush_expired_package(self) -> None:
+        package = self.pending_package
+        if package is None:
+            return
+        if time.monotonic() - package.last_update_monotonic >= self.package_window:
+            self.flush_package()
+
+    def flush_package(self) -> None:
+        package = self.pending_package
+        if package is None:
+            return
+        self.pending_package = None
+        if package.count <= 1:
+            self.render_single_request(package.first_summary)
+            return
+        self.render_package(package, finalized=True)
+
+    def package_duration(self, package: RequestPackage) -> float | None:
+        if package.started_at is not None and package.completed_at is not None:
+            return max(0.0, (package.completed_at - package.started_at).total_seconds())
+        if package.last_summary.duration is not None:
+            return package.last_summary.duration
+        return None
+
+    def package_tokens_per_second(self, package: RequestPackage) -> float | None:
+        duration = self.package_duration(package)
+        if package.output is None or not duration or duration <= 0:
+            return None
+        return package.output / duration
+
+    def package_text(self, package: RequestPackage, *, finalized: bool) -> Text:
+        summary = package.first_summary
+        style = stable_style("\0".join(package.key))
+        stamp = summary.stamp or "-"
+        model = summary.model or "unknown"
+        session = summary.session or summary.client or "unknown"
+        tokens = TokenStats(
+            prompt=package.prompt,
+            cached=package.cached,
+            output=package.output,
+            reasoning=package.reasoning,
+            total=package.total,
+        )
+        fresh = fresh_tokens(tokens)
+        duration = self.package_duration(package)
+        header = Text("╭─ ", style=style)
+        header.append(stamp, style=f"bold {style}")
+        header.append("  ")
+        header.append(model, style=f"bold {style}")
+        header.append(f"  session={session}", style=style)
+        header.append(f"  package={package.count} requests", style=f"bold {style}")
+        if not finalized:
+            header.append("  aggregating", style="dim")
+        body = Text("\n│  ", style=style)
+        values = [
+            ("fresh", fmt_num(fresh)),
+            ("output", fmt_num(package.output)),
+            ("cached", fmt_num(package.cached)),
+            ("total", fmt_num(package.total)),
+            ("tokens/s", fmt_rate(self.package_tokens_per_second(package))),
+            ("duration", fmt_duration(duration)),
+        ]
+        body.append("  ".join(f"{label}={value}" for label, value in values), style=style)
+        footer = Text("\n╰─", style=style)
+        header.append_text(body)
+        header.append_text(footer)
+        return header
+
+    def pending_package_text(self) -> Text:
+        if self.pending_package is None:
+            return Text()
+        return self.package_text(self.pending_package, finalized=False)
+
+    def render_package(self, package: RequestPackage, *, finalized: bool) -> None:
+        if self.rendered_requests:
+            self.console.print()
+        self.console.print(self.package_text(package, finalized=finalized), soft_wrap=True)
+        self.rendered_requests += package.count
+
+    def group_header(self, summary: RequestSummary, style: str) -> Text:
+        text = Text("╭─ ", style=style)
+        text.append(summary.model or "unknown", style=f"bold {style}")
+        text.append("  ")
+        append_kv(text, "client", summary.client or "unknown", style)
+        return text
+
+    def request_line(self, summary: RequestSummary, style: str) -> Text:
+        text = Text("├─ ", style=style)
+        text.append(summary.stamp, style=f"bold {style}")
+        append_kv(text, "status", summary.status, status_style(summary.status))
+        append_kv(text, "duration", fmt_duration(summary.duration), f"bold {style}")
+        append_kv(text, "done", summary.completed_stamp, style)
+        append_kv(text, "finish", summary.finish, style)
+        return text
+
+    def route_line(self, summary: RequestSummary, style: str) -> Text:
+        text = Text("│  ", style=style)
+        if summary.method:
+            text.append(summary.method, style=f"bold {style}")
+            text.append("  ")
+        text.append(summary.endpoint, style=style)
+        append_kv(text, "messages", summary.message_count if summary.message_count else None, style)
+        append_kv(text, "provider", summary.provider, style)
+        append_kv(text, "upstream", summary.upstream, style)
+        return text
+
+    def token_line(self, summary: RequestSummary, style: str) -> Text | None:
+        tokens = summary.tokens
+        if not has_tokens(tokens):
+            return None
+        suspicious_cache_miss = marked_cache_miss(summary)
+        fresh_style = "bold bright_white on red" if suspicious_cache_miss else f"bold {style}"
+        text = Text("│  tokens  ", style=style)
+        append_kv(text, "fresh", fmt_num(fresh_tokens(tokens)), fresh_style, pad=False)
+        append_kv(text, "cached", fmt_num(tokens.cached) if tokens.cached is not None else None, fresh_style if suspicious_cache_miss else style)
+        append_kv(text, "output", fmt_num(tokens.output), f"bold {style}")
+        append_kv(text, "reasoning", fmt_num(tokens.reasoning) if tokens.reasoning else None, style)
+        append_kv(text, "total", fmt_num(tokens.total), f"bold {style}")
+        append_kv(text, "tokens/s", fmt_rate(summary.tokens_per_second), f"bold {style}")
+        if suspicious_cache_miss:
+            text.append("  CACHE-MISS? input>10k cached<1k", style="bold bright_white on red")
+        return text
+
+    def compact_header_line(self, summary: RequestSummary, style: str) -> Text:
+        header, _ = compact_lines(summary)
+        stamp = summary.stamp or "-"
+        model = summary.model or "unknown"
+        text = Text(stamp, style=f"bold {style}")
+        text.append("  ")
+        text.append(model, style=f"bold {style}")
+        suffix = header.removeprefix(f"{stamp}  {model}")
+        text.append(suffix, style=style)
+        return text
+
+    def compact_token_line(self, summary: RequestSummary, style: str) -> Text:
+        tokens = summary.tokens
+        line_style = style
+        if failed_summary(summary):
+            line_style = "bold bright_white on red"
+        elif marked_cache_miss(summary):
+            line_style = "bold bright_white on red"
+        _, token_line = compact_lines(summary)
+        return Text(token_line, style=line_style)
+
+    def usage_line(self, upstream: str, usage: dict[str, Any] | None, error: str | None = None) -> Text:
+        text = Text("◇ USAGE", style="bold bright_white")
+        text.append("  ")
+        text.append(upstream.upper(), style="bold bright_cyan")
+        if error:
+            text.append("  unavailable=", style="dim")
+            text.append(error, style="red")
+            return text
+        if not usage:
+            text.append("  unavailable", style="red")
+            return text
+
+        parts = usage_left_parts(upstream, usage)
+        if not parts:
+            text.append("  unavailable=missing-windows", style="red")
+            return text
+        text.append("  left ", style="dim")
+        text.append(", ".join(parts), style="bold bright_yellow")
+        return text
+
+    def render_usage(self, upstream: str, usage: dict[str, Any] | None, error: str | None = None) -> None:
+        self.render_usage_block([(upstream, usage, error)])
+
+    def render_usage_block(self, snapshots: list[tuple[str, dict[str, Any] | None, str | None]]) -> None:
+        self.separate_from_request_group(blank=False)
+        self.console.print()
+        self.console.print()
+        for upstream, usage, error in snapshots:
+            self.console.print(self.usage_line(upstream, usage, error), soft_wrap=True)
+        self.console.print()
+        self.console.print()
+
+
+def fetch_chatgpt_usage(auth_dir: str, auth_file: str) -> tuple[dict[str, Any] | None, str | None]:
+    token, account_id, auth_error = load_chatgpt_auth(auth_dir, auth_file)
+    if auth_error:
+        return None, auth_error
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "cliproxy-logs",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    try:
+        request = urllib.request.Request(CHATGPT_USAGE_URL, headers=headers)
+        with urllib.request.urlopen(request, timeout=4) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except Exception as exc:
+        return None, exc.__class__.__name__
+    if isinstance(data, dict):
+        return data, None
+    return None, "bad-response"
+
+
+def fetch_anthropic_usage(auth_dir: str, auth_file: str) -> tuple[dict[str, Any] | None, str | None]:
+    token, auth_error = load_anthropic_auth(auth_dir, auth_file)
+    if auth_error:
+        return None, auth_error
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "cliproxy-logs",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+    }
+    try:
+        request = urllib.request.Request(ANTHROPIC_USAGE_URL, headers=headers)
+        with urllib.request.urlopen(request, timeout=4) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        message = ""
+        try:
+            body = json.loads(exc.read().decode("utf-8", "replace"))
+            raw = body.get("error", {}).get("message") if isinstance(body, dict) else ""
+            message = f": {raw.strip()}" if isinstance(raw, str) and raw.strip() else ""
+        except Exception:
+            pass
+        return None, f"HTTP {exc.code}{message}"
+    except Exception as exc:
+        return None, exc.__class__.__name__
+    if isinstance(data, dict):
+        return data, None
+    return None, "bad-response"
+
+
+def fetch_usage_snapshots(args: argparse.Namespace) -> list[tuple[str, dict[str, Any] | None, str | None]]:
+    return [
+        ("chatgpt", *fetch_chatgpt_usage(args.auth_dir, args.codex_auth_file)),
+        ("anthropic", *fetch_anthropic_usage(args.auth_dir, args.claude_auth_file)),
+    ]
+
+
+def wait_for_stable_file(path: Path) -> None:
+    previous = -1
+    for _ in range(8):
+        try:
+            current = path.stat().st_size
+        except OSError:
+            return
+        if current > 0 and current == previous:
+            return
+        previous = current
+        time.sleep(0.3)
+
+
+def log_has_response(path: Path) -> bool:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return False
+    response_text = section(text, "RESPONSE", last=True)
+    api_response_text = section(text, "API RESPONSE 1", last=True) or section(text, "API RESPONSE", last=True)
+    api_error_response_text = section(text, "API ERROR RESPONSE", last=True)
+    response_source = "\n".join(part for part in (response_text, api_response_text, api_error_response_text) if part)
+    if re.search(r"\b(?:HTTP\s+)?Status:\s*\d+", response_source):
+        return True
+    return bool(response_source.strip())
+
+
+def refresh_active_request(active: ActiveRequest) -> None:
+    try:
+        current_size = active.path.stat().st_size
+    except OSError:
+        active.missing_checks += 1
+        return
+
+    active.missing_checks = 0
+    size_changed = current_size != active.last_size
+    if not size_changed:
+        active.stable_checks += 1
+    else:
+        active.last_size = current_size
+        active.stable_checks = 0
+
+    if size_changed or active.summary is None:
+        summary = parse_log(active.path)
+        if summary is not None:
+            active.summary = summary
+        active.has_response = log_has_response(active.path)
+
+
+def active_request_state(active: ActiveRequest) -> str:
+    if active.has_response:
+        return "finishing"
+    if active.summary and active.summary.endpoint:
+        return "processing"
+    return "opening"
+
+
+def active_requests_text(active_requests: list[ActiveRequest], max_display: int = 20) -> Text:
+    text = Text()
+    if not active_requests:
+        return text
+
+    label = "request" if len(active_requests) == 1 else "requests"
+    text.append(f"◇ ACTIVE {len(active_requests)} {label}", style="bold bright_white")
+    now = time.monotonic()
+    sorted_active = sorted(active_requests, key=lambda item: item.first_seen_monotonic)
+    visible = sorted_active[: max(0, max_display)]
+    for active in visible:
+        summary = active.summary
+        style = stable_style("\0".join(summary.group_key)) if summary else "bright_cyan"
+        elapsed = now - active.first_seen_monotonic
+        text.append("\n")
+        text.append("  ")
+        text.append(f"{fmt_duration(elapsed)}", style=f"bold {style}")
+        text.append("  ")
+        text.append(active_request_state(active), style=style)
+        if summary is not None:
+            text.append("  ")
+            text.append(summary.model or "unknown", style=f"bold {style}")
+            append_kv(text, "client", summary.client or "unknown", style)
+            if summary.endpoint:
+                text.append("  ")
+                if summary.method:
+                    text.append(summary.method, style=f"bold {style}")
+                    text.append(" ")
+                text.append(summary.endpoint, style=style)
+    hidden = len(sorted_active) - len(visible)
+    if hidden > 0:
+        text.append("\n  ")
+        text.append(f"... {hidden} more active requests hidden", style="bold bright_black")
+    return text
+
+
+def live_status_text(
+    active_requests: list[ActiveRequest],
+    usage_snapshot: tuple[str, dict[str, Any] | None, str | None] | None,
+    management_usage_error: str | None = None,
+    max_active_display: int = 20,
+    pending_package: Text | None = None,
+    usage_pacer: Gpt55UsagePacer | None = None,
+) -> Text:
+    text = active_requests_text(active_requests, max_active_display)
+    if pending_package is not None and pending_package.plain:
+        if text.plain:
+            text.append("\n")
+        text.append_text(pending_package)
+    if management_usage_error:
+        if text.plain:
+            text.append("\n")
+        text.append("◇ MANAGEMENT USAGE", style="bold bright_white")
+        text.append("  unavailable=", style="dim")
+        text.append(management_usage_error, style="red")
+    footer = footer_usage_text(usage_snapshot, usage_pacer)
+    if not footer.plain:
+        return text
+    if text.plain:
+        text.append("\n")
+    text.append("\n\n\n\n")
+    text.append_text(footer)
+    return text
+
+
+def safe_log_dir_entries(log_dir: Path) -> list[Path]:
+    try:
+        entries = list(log_dir.iterdir())
+    except OSError:
+        return []
+
+    with_mtime: list[tuple[int, Path]] = []
+    for path in entries:
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        with_mtime.append((mtime, path))
+    return [path for _mtime, path in sorted(with_mtime)]
+
+
+def is_regular_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def request_log_candidates(log_dir: Path, limit: int) -> list[Path]:
+    if limit <= 0:
+        return []
+    found: list[Path] = []
+    for path in reversed(safe_log_dir_entries(log_dir)):
+        if not is_request_log(path.name) or not is_regular_file(path):
+            continue
+        found.append(path)
+        if len(found) >= limit:
+            break
+    return list(reversed(found))
+
+
+def path_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def recent_completed_request_logs(log_dir: Path, limit: int) -> list[Path]:
+    if limit <= 0:
+        return []
+    found: list[Path] = []
+    for path in reversed(request_log_candidates(log_dir, max(limit * 20, limit))):
+        if not log_has_response(path):
+            continue
+        found.append(path)
+        if len(found) >= limit:
+            break
+    return list(reversed(found))
+
+
+class PollingWatcher:
+    def __init__(self, log_dir: Path, poll_interval: float) -> None:
+        self.log_dir = log_dir
+        self.poll_interval = poll_interval
+        self.seen = {path.name for path in safe_log_dir_entries(log_dir)}
+
+    def read(self, timeout: float) -> list[Path]:
+        time.sleep(max(timeout, self.poll_interval))
+        paths: list[Path] = []
+        for path in safe_log_dir_entries(self.log_dir):
+            if path.name in self.seen:
+                continue
+            self.seen.add(path.name)
+            paths.append(path)
+        return paths
+
+    def close(self) -> None:
+        return None
+
+
+class InotifyWatcher:
+    IN_CREATE = 0x00000100
+    IN_MOVED_TO = 0x00000080
+
+    def __init__(self, log_dir: Path) -> None:
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
+            raise RuntimeError("libc not found")
+        self.libc = ctypes.CDLL(libc_name, use_errno=True)
+        flags = getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        self.fd = self.libc.inotify_init1(flags)
+        if self.fd < 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, os.strerror(errno))
+        watch = self.libc.inotify_add_watch(
+            self.fd,
+            os.fsencode(log_dir),
+            self.IN_CREATE | self.IN_MOVED_TO,
+        )
+        if watch < 0:
+            errno = ctypes.get_errno()
+            os.close(self.fd)
+            raise OSError(errno, os.strerror(errno))
+        self.event_size = struct.calcsize("iIII")
+        self.log_dir = log_dir
+
+    @classmethod
+    def create(cls, log_dir: Path) -> "InotifyWatcher | None":
+        if sys.platform != "linux":
+            return None
+        try:
+            return cls(log_dir)
+        except Exception:
+            return None
+
+    def read(self, timeout: float) -> list[Path]:
+        try:
+            ready, _, _ = select.select([self.fd], [], [], max(timeout, 0.0))
+        except OSError:
+            return []
+        if not ready:
+            return []
+        try:
+            data = os.read(self.fd, 65536)
+        except (BlockingIOError, OSError):
+            return []
+
+        paths: list[Path] = []
+        offset = 0
+        while offset + self.event_size <= len(data):
+            _wd, _mask, _cookie, name_len = struct.unpack_from("iIII", data, offset)
+            offset += self.event_size
+            raw_name = data[offset : offset + name_len].split(b"\0", 1)[0]
+            offset += name_len
+            if raw_name:
+                paths.append(self.log_dir / os.fsdecode(raw_name))
+        return paths
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+class LoopWatchdog:
+    def __init__(self, timeout: float, check_interval: float) -> None:
+        self.timeout = max(0.0, timeout)
+        self.check_interval = max(1.0, check_interval)
+        self.last_heartbeat = time.monotonic()
+        self.stopped = False
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.timeout <= 0:
+            return
+        self.thread = threading.Thread(target=self._run, name="cliproxy-log-watchdog", daemon=True)
+        self.thread.start()
+
+    def heartbeat(self) -> None:
+        if self.timeout <= 0:
+            return
+        with self.lock:
+            self.last_heartbeat = time.monotonic()
+
+    def stop(self) -> None:
+        with self.lock:
+            self.stopped = True
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.check_interval)
+            with self.lock:
+                if self.stopped:
+                    return
+                elapsed = time.monotonic() - self.last_heartbeat
+            if elapsed <= self.timeout:
+                continue
+            message = (
+                f"\ncliproxy logger watchdog: no main-loop heartbeat for {elapsed:.0f}s; "
+                "restarting same command...\n"
+            )
+            try:
+                os.write(2, message.encode("utf-8", "replace"))
+            except OSError:
+                pass
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def render_summary(renderer: GroupedRenderer, summary: RequestSummary, rendered_fingerprints: set[tuple[Any, ...]] | None = None) -> bool:
+    fingerprint = request_fingerprint(summary)
+    if rendered_fingerprints is not None and fingerprint in rendered_fingerprints:
+        return False
+    renderer.render_request(summary)
+    if rendered_fingerprints is not None:
+        rendered_fingerprints.add(fingerprint)
+    try:
+        write_named_log_copy(summary)
+        write_cache_miss(summary)
+    except OSError as err:
+        renderer.console.print(f"log copy write failed for {summary.path}: {err}", style="red", highlight=False)
+    return True
+
+
+def render_file(renderer: GroupedRenderer, path: Path, rendered_fingerprints: set[tuple[Any, ...]] | None = None) -> bool:
+    summary = parse_log(path)
+    if summary is not None:
+        return render_summary(renderer, summary, rendered_fingerprints)
+    return False
+
+
+def completion_sort_key(active: ActiveRequest) -> tuple[float, str]:
+    summary = active.summary
+    if summary is not None and summary.completed_at is not None:
+        return (summary.completed_at.timestamp(), active.path.name)
+    try:
+        return (active.path.stat().st_mtime, active.path.name)
+    except OSError:
+        return (time.time(), active.path.name)
+
+
+def discover_active_requests(
+    paths: list[Path],
+    active_requests: dict[str, ActiveRequest],
+    rendered_names: set[str],
+    ignored_names: set[str],
+    *,
+    min_mtime_ns: int | None = None,
+) -> None:
+    now = time.monotonic()
+    for path in paths:
+        if not is_request_log(path.name) or path.name in rendered_names or path.name in ignored_names:
+            continue
+        if min_mtime_ns is not None:
+            mtime_ns = path_mtime_ns(path)
+            if mtime_ns is None or mtime_ns < min_mtime_ns:
+                continue
+        active_requests.setdefault(path.name, ActiveRequest(path=path, first_seen_monotonic=now))
+
+
+def live_tail(args: argparse.Namespace, console: Console) -> None:
+    log_dir = Path(args.log_dir).expanduser()
+    if not log_dir.is_dir():
+        console.print(f"[bold red]ERROR:[/] log dir not found: {log_dir}", highlight=False)
+        console.print("Make sure CLIProxyAPI is running and request-log: true is set.", style="dim")
+        raise SystemExit(1)
+
+    renderer = GroupedRenderer(console, args.package_window)
+    watcher = InotifyWatcher.create(log_dir) or PollingWatcher(log_dir, args.poll_interval)
+    watchdog = LoopWatchdog(args.watchdog_timeout, args.watchdog_check_interval)
+    watchdog.start()
+    using_inotify = isinstance(watcher, InotifyWatcher)
+    active_requests: dict[str, ActiveRequest] = {}
+    rendered_names: set[str] = set()
+    rendered_fingerprints: set[tuple[Any, ...]] = set()
+    seen_usage_keys: set[tuple[Any, ...]] = set()
+    usage_bootstrapped = False
+    next_management_usage = 0.0
+    footer_usage: tuple[str, dict[str, Any] | None, str | None] | None = None
+    management_usage_error: str | None = None
+    usage_pacer = Gpt55UsagePacer()
+    management_event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    management_stream_stop = threading.Event()
+    management_stream_thread: threading.Thread | None = None
+    next_management_stream_retry = float("inf")
+    next_footer_usage = 0.0
+    ignored_startup_complete_names: set[str] = set()
+    start_mtime_ns = time.time_ns()
+    rescan_enabled = args.rescan_interval > 0 and not using_inotify
+    next_rescan = time.monotonic() + max(args.rescan_interval, 0.0) if rescan_enabled else float("inf")
+    last_live_plain = ""
+    if args.management_usage_interval > 0:
+        snapshot, management_usage_error = fetch_management_usage(args.base_url)
+        if snapshot is not None:
+            seen_usage_keys = {key for key, _summary in usage_summaries(snapshot, log_dir)}
+            usage_bootstrapped = True
+        if args.management_usage_stream:
+            management_stream_thread = threading.Thread(
+                target=stream_management_usage_events,
+                args=(args.base_url, management_event_queue, management_stream_stop),
+                name="cliproxy-management-usage-stream",
+                daemon=True,
+            )
+            management_stream_thread.start()
+            next_management_usage = float("inf")
+        else:
+            next_management_usage = time.monotonic() + args.management_usage_interval
+    if args.footer_usage_interval > 0:
+        footer_usage = ("chatgpt", *fetch_chatgpt_usage(args.auth_dir, args.codex_auth_file))
+        if footer_usage[1] is not None and footer_usage[2] is None:
+            usage_pacer.observe_chatgpt_usage(footer_usage[1])
+        next_footer_usage = time.monotonic() + args.footer_usage_interval
+
+    initial_paths = recent_completed_request_logs(log_dir, args.initial)
+    ignored_startup_complete_names = {path.name for path in initial_paths}
+    if initial_paths:
+        console.print(
+            f"Showing latest {len(initial_paths)} completed request log(s) from [bold]{log_dir}[/]",
+            highlight=False,
+        )
+        for path in initial_paths:
+            if render_file(renderer, path, rendered_fingerprints):
+                rendered_names.add(path.name)
+        renderer.flush_package()
+        console.print()
+    elif args.initial > 0:
+        console.print(f"No completed request logs found yet in [bold]{log_dir}[/].", highlight=False)
+
+    console.print(f"Watching [bold]{log_dir}[/] for new request logs. Press Ctrl-C to stop.", highlight=False)
+    console.print("Display timezone: GMT-3", style="dim")
+    if args.management_usage_interval > 0:
+        if args.management_usage_stream:
+            console.print(
+                f"Optional management usage stream enabled: {management_usage_events_url(args.base_url)}",
+                style="dim",
+                highlight=False,
+            )
+        console.print(
+            f"Management usage fallback polling: {management_usage_url(args.base_url)} every {args.management_usage_interval:g}s",
+            style="dim",
+            highlight=False,
+        )
+    if args.footer_usage_interval > 0:
+        console.print(
+            f"Codex usage footer: {CHATGPT_USAGE_URL} every {args.footer_usage_interval:g}s",
+            style="dim",
+            highlight=False,
+        )
+    if not using_inotify:
+        console.print("inotify unavailable; polling for new files.", style="dim")
+    try:
+        with Live(Text(), console=console, auto_refresh=False, transient=True) as live:
+            while True:
+                watchdog.heartbeat()
+                if (
+                    args.management_usage_stream
+                    and args.management_usage_interval > 0
+                    and management_stream_thread is None
+                    and time.monotonic() >= next_management_stream_retry
+                ):
+                    management_stream_thread = threading.Thread(
+                        target=stream_management_usage_events,
+                        args=(args.base_url, management_event_queue, management_stream_stop),
+                        name="cliproxy-management-usage-stream",
+                        daemon=True,
+                    )
+                    management_stream_thread.start()
+                    next_management_stream_retry = float("inf")
+                    next_management_usage = float("inf")
+                timeout = args.poll_interval
+                if args.management_usage_interval > 0:
+                    timeout = min(timeout, max(0.0, next_management_usage - time.monotonic()))
+                if args.management_usage_stream and management_stream_thread is None:
+                    timeout = min(timeout, max(0.0, next_management_stream_retry - time.monotonic()))
+                if args.footer_usage_interval > 0:
+                    timeout = min(timeout, max(0.0, next_footer_usage - time.monotonic()))
+                if rescan_enabled:
+                    timeout = min(timeout, max(0.0, next_rescan - time.monotonic()))
+                if management_stream_thread is not None:
+                    timeout = min(timeout, 0.5)
+                for path in watcher.read(timeout):
+                    discover_active_requests(
+                        [path],
+                        active_requests,
+                        rendered_names,
+                        ignored_startup_complete_names,
+                        min_mtime_ns=start_mtime_ns,
+                    )
+
+                if rescan_enabled and time.monotonic() >= next_rescan:
+                    discover_active_requests(
+                        request_log_candidates(log_dir, args.scan_limit),
+                        active_requests,
+                        rendered_names,
+                        ignored_startup_complete_names,
+                        min_mtime_ns=start_mtime_ns,
+                    )
+                    next_rescan = time.monotonic() + args.rescan_interval
+
+                completed: list[ActiveRequest] = []
+                for active in list(active_requests.values()):
+                    refresh_active_request(active)
+                    if active.missing_checks >= 2:
+                        active_requests.pop(active.path.name, None)
+                        continue
+                    if active.has_response and (active.stable_checks >= 1 or time.monotonic() - active.first_seen_monotonic > 5.0):
+                        completed.append(active)
+
+                completed.sort(key=completion_sort_key)
+                for active in completed:
+                    active_requests.pop(active.path.name, None)
+
+                if args.footer_usage_interval > 0 and time.monotonic() >= next_footer_usage:
+                    footer_usage = ("chatgpt", *fetch_chatgpt_usage(args.auth_dir, args.codex_auth_file))
+                    if footer_usage[1] is not None and footer_usage[2] is None:
+                        usage_pacer.observe_chatgpt_usage(footer_usage[1])
+                    next_footer_usage = time.monotonic() + args.footer_usage_interval
+
+                while True:
+                    try:
+                        event_kind, event_payload = management_event_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if event_kind == "usage_event":
+                        pair = usage_event_summary(event_payload, log_dir)
+                        if pair is None:
+                            continue
+                        key, summary = pair
+                        if key in seen_usage_keys:
+                            continue
+                        seen_usage_keys.add(key)
+                        usage_pacer.observe_summary(summary)
+                        render_summary(renderer, summary, rendered_fingerprints)
+                    elif event_kind == "stream_error":
+                        management_stream_thread = None
+                        next_management_usage = time.monotonic() + args.management_usage_interval
+                        next_management_stream_retry = time.monotonic() + 30.0
+
+                renderer.flush_expired_package()
+                live_text = live_status_text(
+                    list(active_requests.values()),
+                    footer_usage,
+                    management_usage_error,
+                    args.max_active_display,
+                    renderer.pending_package_text(),
+                    usage_pacer,
+                )
+                if live_text.plain != last_live_plain:
+                    live.update(live_text, refresh=True)
+                    last_live_plain = live_text.plain
+
+                if args.management_usage_interval > 0 and time.monotonic() >= next_management_usage:
+                    snapshot, management_usage_error = fetch_management_usage(args.base_url)
+                    if snapshot is not None:
+                        pairs = usage_summaries(snapshot, log_dir)
+                        if not usage_bootstrapped:
+                            seen_usage_keys = {key for key, _summary in pairs}
+                            usage_bootstrapped = True
+                        else:
+                            for key, summary in pairs:
+                                if key in seen_usage_keys:
+                                    continue
+                                seen_usage_keys.add(key)
+                                usage_pacer.observe_summary(summary)
+                                render_summary(renderer, summary, rendered_fingerprints)
+                    next_management_usage = time.monotonic() + args.management_usage_interval
+
+                for active in completed:
+                    if render_file(renderer, active.path, rendered_fingerprints):
+                        rendered_names.add(active.path.name)
+                watchdog.heartbeat()
+
+    except KeyboardInterrupt:
+        console.print()
+    finally:
+        management_stream_stop.set()
+        watchdog.stop()
+        watcher.close()
+        renderer.flush_package()
+        renderer.close_group()
+
+
+def main() -> int:
+    args = parse_args()
+    console = Console(highlight=False)
+    renderer = GroupedRenderer(console, args.package_window)
+
+    if args.file:
+        for raw in args.file:
+            render_file(renderer, Path(raw).expanduser())
+        renderer.close_group()
+        return 0
+
+    live_tail(args, console)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

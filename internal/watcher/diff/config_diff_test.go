@@ -91,7 +91,6 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	expectContains(t, details, "ampcode.model-mappings: updated (1 -> 2 entries)")
 	expectContains(t, details, "remote-management.allow-remote: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
-	expectContains(t, details, "remote-management.secret-key: updated")
 	expectContains(t, details, "oauth-excluded-models[providera]: updated (1 -> 2 entries)")
 	expectContains(t, details, "oauth-excluded-models[providerb]: added (1 entries)")
 	expectContains(t, details, "openai-compatibility:")
@@ -212,9 +211,7 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 	}
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
-	expectContains(t, details, "api-keys count: 1 -> 3")
 	expectContains(t, details, "ampcode.upstream-api-key: added")
-	expectContains(t, details, "remote-management.secret-key: created")
 }
 
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
@@ -300,7 +297,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "quota-exceeded.switch-project: false -> true")
 	expectContains(t, details, "quota-exceeded.switch-preview-model: false -> true")
 	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
-	expectContains(t, details, "api-keys count: 1 -> 2")
 	expectContains(t, details, "claude-api-key count: 1 -> 2")
 	expectContains(t, details, "codex-api-key count: 1 -> 2")
 	expectContains(t, details, "ampcode.restrict-management-to-localhost: false -> true")
@@ -308,7 +304,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "remote-management.disable-control-panel: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, details, "remote-management.panel-github-repository: old/repo -> new/repo")
-	expectContains(t, details, "remote-management.secret-key: deleted")
 }
 
 func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
@@ -443,7 +438,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "quota-exceeded.switch-project: false -> true")
 	expectContains(t, changes, "quota-exceeded.switch-preview-model: false -> true")
 	expectContains(t, changes, "quota-exceeded.antigravity-credits: false -> true")
-	expectContains(t, changes, "api-keys: values updated (count unchanged, redacted)")
 	expectContains(t, changes, "gemini[0].base-url: http://g-old -> http://g-new")
 	expectContains(t, changes, "gemini[0].proxy-url: http://gp-old -> http://gp-new")
 	expectContains(t, changes, "gemini[0].api-key: updated")
@@ -475,7 +469,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "remote-management.disable-control-panel: false -> true")
 	expectContains(t, changes, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, changes, "remote-management.panel-github-repository: old/repo -> new/repo")
-	expectContains(t, changes, "remote-management.secret-key: deleted")
 	expectContains(t, changes, "openai-compatibility:")
 }
 
@@ -523,7 +516,6 @@ func TestBuildConfigChangeDetails_SecretAndUpstreamUpdates(t *testing.T) {
 
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, changes, "ampcode.upstream-api-key: updated")
-	expectContains(t, changes, "remote-management.secret-key: updated")
 }
 
 func TestBuildConfigChangeDetails_CountBranches(t *testing.T) {

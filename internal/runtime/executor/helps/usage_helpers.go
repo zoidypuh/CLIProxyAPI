@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -27,25 +29,49 @@ type UsageReporter struct {
 	apiKey      string
 	source      string
 	reasoning   string
+	sessionID   string
+	requestID   string
+	logFile     string
 	requestedAt time.Time
 	once        sync.Once
 }
 
-func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
+func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth, opts ...cliproxyexecutor.Options) *UsageReporter {
 	apiKey := APIKeyFromContext(ctx)
+	usageModel := strings.TrimSpace(model)
+	if len(opts) > 0 {
+		usageModel = PayloadRequestedModel(opts[0], usageModel)
+	}
 	alias := usage.RequestedModelAliasFromContext(ctx)
 	if alias == "" {
-		alias = model
+		alias = usageModel
+	}
+	sessionID := ""
+	if len(opts) > 0 {
+		sessionID = UsageSessionID(opts[0])
+	}
+	if isLocalUsageSessionLabel(apiKey) {
+		sessionID = apiKey
+	} else if strings.EqualFold(provider, "codex") && looksLikeUUIDSessionID(sessionID) {
+		sessionID = "codex"
 	}
 	reporter := &UsageReporter{
 		provider:    provider,
-		model:       model,
+		model:       usageModel,
 		alias:       strings.TrimSpace(alias),
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
+		sessionID:   sessionID,
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		reporter.requestID = internallogging.GetGinRequestID(ginCtx)
+		reporter.logFile = internallogging.GetGinRequestLogFile(ginCtx)
+	}
+	if reporter.requestID == "" {
+		reporter.requestID = internallogging.GetRequestID(ctx)
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -63,7 +89,7 @@ func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string
 	if !ok {
 		return
 	}
-	r.publishRecord(ctx, record)
+	usage.PublishRecord(ctx, record)
 }
 
 func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.Detail) (usage.Record, bool) {
@@ -166,6 +192,9 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:          r.authID,
 		AuthIndex:       r.authIndex,
 		AuthType:        r.authType,
+		SessionID:        r.sessionID,
+		RequestID:        r.requestID,
+		LogFile:          r.logFile,
 		ReasoningEffort: r.reasoning,
 		RequestedAt:     r.requestedAt,
 		Latency:         r.latency(),
@@ -180,9 +209,7 @@ func failFromErrors(errs ...error) usage.Failure {
 		if err == nil {
 			continue
 		}
-		fail := usage.Failure{
-			Body: strings.TrimSpace(err.Error()),
-		}
+		fail := usage.Failure{Body: strings.TrimSpace(err.Error())}
 		var se interface{ StatusCode() int }
 		if errors.As(err, &se) && se != nil {
 			fail.StatusCode = se.StatusCode()
@@ -190,6 +217,42 @@ func failFromErrors(errs ...error) usage.Failure {
 		return fail
 	}
 	return usage.Failure{}
+}
+
+func UsageSessionID(opts cliproxyexecutor.Options) string {
+	if opts.Metadata != nil {
+		if value := strings.TrimSpace(fmt.Sprint(opts.Metadata[cliproxyexecutor.RequestSessionIDMetadataKey])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	if opts.Headers != nil {
+		for _, name := range []string{"Session_id", "Session-Id", "X-Session-ID"} {
+			if value := strings.TrimSpace(opts.Headers.Get(name)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func looksLikeUUIDSessionID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 {
+		return false
+	}
+	for i, char := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (r *UsageReporter) latency() time.Duration {
@@ -211,7 +274,7 @@ func APIKeyFromContext(ctx context.Context) string {
 	if !ok || ginCtx == nil {
 		return ""
 	}
-	if v, exists := ginCtx.Get("userApiKey"); exists {
+	if v, exists := ginCtx.Get("apiKey"); exists {
 		switch value := v.(type) {
 		case string:
 			return value
@@ -221,7 +284,57 @@ func APIKeyFromContext(ctx context.Context) string {
 			return fmt.Sprintf("%v", value)
 		}
 	}
+	if ginCtx.Request != nil {
+		if key := localSessionLabelFromHeaders(ginCtx.Request.Header); key != "" {
+			return key
+		}
+	}
 	return ""
+}
+
+func localSessionLabelFromHeaders(headers http.Header) string {
+	for _, name := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
+		value := strings.TrimSpace(headers.Get(name))
+		if value == "" {
+			continue
+		}
+		if strings.EqualFold(name, "Authorization") {
+			parts := strings.SplitN(value, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+				value = strings.TrimSpace(parts[1])
+			}
+		}
+		if isLocalUsageSessionLabel(value) {
+			return value
+		}
+	}
+	return ""
+}
+
+func isLocalUsageSessionLabel(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"sk-", "nvapi-", "eyj", "rt_", "aiza", "venice_"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' {
+			continue
+		}
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		if char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
@@ -282,7 +395,7 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("response.usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
 	return parseOpenAIStyleUsageNode(usageNode), true
@@ -290,7 +403,7 @@ func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 
 func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("response.tool_usage.image_gen")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+	if !usageNode.Exists() || !usageNode.IsObject() {
 		return usage.Detail{}, false
 	}
 	return parseOpenAIStyleUsageNode(usageNode), true
@@ -298,25 +411,10 @@ func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
 	return parseOpenAIStyleUsageNode(usageNode)
-}
-
-func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
-	if !usageNode.Exists() || !usageNode.IsObject() {
-		return false
-	}
-	return usageNode.Get("prompt_tokens").Exists() ||
-		usageNode.Get("input_tokens").Exists() ||
-		usageNode.Get("completion_tokens").Exists() ||
-		usageNode.Get("output_tokens").Exists() ||
-		usageNode.Get("total_tokens").Exists() ||
-		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
-		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
-		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
-		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
 }
 
 func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
@@ -356,10 +454,21 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	detail := usage.Detail{
+		InputTokens:  usageNode.Get("prompt_tokens").Int(),
+		OutputTokens: usageNode.Get("completion_tokens").Int(),
+		TotalTokens:  usageNode.Get("total_tokens").Int(),
+	}
+	if cached := usageNode.Get("prompt_tokens_details.cached_tokens"); cached.Exists() {
+		detail.CachedTokens = cached.Int()
+	}
+	if reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens"); reasoning.Exists() {
+		detail.ReasoningTokens = reasoning.Int()
+	}
+	return detail, true
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
@@ -367,7 +476,17 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
-	return parseClaudeUsageNode(usageNode)
+	detail := usage.Detail{
+		InputTokens:  usageNode.Get("input_tokens").Int(),
+		OutputTokens: usageNode.Get("output_tokens").Int(),
+		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+	}
+	if detail.CachedTokens == 0 {
+		// fall back to creation tokens when read tokens are absent
+		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+	}
+	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	return detail
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
@@ -379,24 +498,16 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
-	return parseClaudeUsageNode(usageNode), true
-}
-
-func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
-	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
-	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:         usageNode.Get("input_tokens").Int(),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        cacheReadTokens,
-		CacheReadTokens:     cacheReadTokens,
-		CacheCreationTokens: cacheCreationTokens,
+		InputTokens:  usageNode.Get("input_tokens").Int(),
+		OutputTokens: usageNode.Get("output_tokens").Int(),
+		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
 	}
 	if detail.CachedTokens == 0 {
-		detail.CachedTokens = detail.CacheCreationTokens
+		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
-	return detail
+	return detail, true
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {

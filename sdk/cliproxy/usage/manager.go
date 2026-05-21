@@ -20,6 +20,9 @@ type Record struct {
 	AuthIndex string
 	AuthType  string
 	Source    string
+	SessionID string
+	RequestID string
+	LogFile   string
 	// ReasoningEffort stores the client-requested thinking level for request event logs.
 	ReasoningEffort string
 	RequestedAt     time.Time

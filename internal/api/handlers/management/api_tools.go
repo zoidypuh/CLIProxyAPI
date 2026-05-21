@@ -63,12 +63,9 @@ type apiCallResponse struct {
 //
 //	POST /v0/management/api-call
 //
-// Authentication:
+// Access control:
 //
-//	Same as other management APIs (requires a management key and remote-management rules).
-//	You can provide the key via:
-//	- Authorization: Bearer <key>
-//	- X-Management-Key: <key>
+//	Same as other management APIs (localhost by default, or remote access when enabled).
 //
 // Request JSON:
 //   - auth_index / authIndex / AuthIndex (optional):

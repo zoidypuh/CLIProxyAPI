@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,10 +29,13 @@ const (
 	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
 	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
 	managementAssetName          = "management.html"
+	managementPinnedMarkerSuffix = ".pinned"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
 	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	managementLocalOverridesFile = "management-local-overrides.js"
+	managementLocalOverridesTag  = `<script defer src="/management-local-overrides.js"></script>`
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -44,6 +48,8 @@ var (
 	schedulerOnce       sync.Once
 	schedulerConfigPath atomic.Value
 	sfGroup             singleflight.Group
+
+	managementPasswordRequiredCheckPattern = regexp.MustCompile("if\\s*\\(\\s*![A-Za-z_$][A-Za-z0-9_$]*\\.trim\\(\\)\\s*\\)\\s*\\{\\s*[A-Za-z_$][A-Za-z0-9_$]*\\s*\\(\\s*[A-Za-z_$][A-Za-z0-9_$]*\\s*\\(\\s*[\"'`]login\\.error_required[\"'`]\\s*\\)\\s*\\)\\s*;\\s*return\\s*\\}")
 )
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
@@ -190,6 +196,18 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return false
 	}
 	localPath := filepath.Join(staticDir, managementAssetName)
+	EnsureNoKeyManagementHTML(localPath)
+	if pinnedManagementAsset(localPath) {
+		if _, err := os.Stat(localPath); err == nil {
+			log.Debug("management asset sync skipped: pinned local asset is present")
+			return true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.WithError(err).Warn("failed to stat pinned local management asset")
+			return false
+		}
+		log.Warn("management asset sync skipped: pin marker exists but local asset is missing")
+		return false
+	}
 
 	_, _, _ = sfGroup.Do(localPath, func() (interface{}, error) {
 		lastUpdateCheckMu.Lock()
@@ -277,7 +295,87 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return nil, nil
 	})
 
+	EnsureNoKeyManagementHTML(localPath)
 	_, err := os.Stat(localPath)
+	return err == nil
+}
+
+// EnsureNoKeyManagementHTML patches older downloaded management panels so they
+// remain compatible with keyless local management endpoints.
+func EnsureNoKeyManagementHTML(localPath string) {
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return
+	}
+
+	content := string(data)
+	patched := content
+	patched = managementPasswordRequiredCheckPattern.ReplaceAllString(patched, `if(false){return}`)
+	patched = replaceManagementLoginText(patched)
+	if !strings.Contains(patched, managementLocalOverridesFile) {
+		if strings.Contains(patched, "</body>") {
+			patched = strings.Replace(patched, "</body>", "    "+managementLocalOverridesTag+"\n  </body>", 1)
+		} else {
+			patched += "\n" + managementLocalOverridesTag + "\n"
+		}
+	}
+
+	if patched == content {
+		return
+	}
+	if err = atomicWriteFile(localPath, []byte(patched)); err != nil {
+		log.WithError(err).Warn("failed to patch management control panel for keyless access")
+		return
+	}
+	log.Info("management control panel patched for keyless access")
+}
+
+type managementTextReplacement struct {
+	key     string
+	oldText string
+	newText string
+}
+
+func replaceManagementLoginText(content string) string {
+	replacements := []managementTextReplacement{
+		{key: "remember_password_label", oldText: "Remember password", newText: "Remember connection"},
+		{key: "management_key_label", oldText: "Management Key:", newText: "Management Access:"},
+		{key: "management_key_placeholder", oldText: "Enter the management key", newText: "No password required"},
+		{key: "error_invalid", oldText: "Connection failed, please check address and key", newText: "Connection failed, please check address"},
+		{key: "error_unauthorized", oldText: "Authentication failed, invalid management key", newText: "Authentication failed"},
+		{key: "remember_password_label", oldText: "记住密码", newText: "记住连接"},
+		{key: "management_key_label", oldText: "管理密钥:", newText: "管理访问:"},
+		{key: "management_key_placeholder", oldText: "请输入管理密钥", newText: "无需密码"},
+		{key: "error_invalid", oldText: "连接失败，请检查地址和密钥", newText: "连接失败，请检查地址"},
+		{key: "error_unauthorized", oldText: "认证失败，管理密钥无效", newText: "认证失败"},
+		{key: "remember_password_label", oldText: "記住密碼", newText: "記住連線"},
+		{key: "management_key_label", oldText: "管理金鑰:", newText: "管理存取:"},
+		{key: "management_key_placeholder", oldText: "請輸入管理金鑰", newText: "無需密碼"},
+		{key: "error_invalid", oldText: "連線失敗，請檢查位址和金鑰", newText: "連線失敗，請檢查位址"},
+		{key: "error_unauthorized", oldText: "驗證失敗，管理金鑰無效", newText: "驗證失敗"},
+		{key: "remember_password_label", oldText: "Запомнить пароль", newText: "Запомнить подключение"},
+		{key: "management_key_label", oldText: "Ключ управления:", newText: "Доступ к управлению:"},
+		{key: "management_key_placeholder", oldText: "Введите ключ управления", newText: "Пароль не требуется"},
+		{key: "error_unauthorized", oldText: "Ошибка аутентификации, недействительный ключ управления", newText: "Ошибка аутентификации"},
+		{key: "error_invalid", oldText: "Не удалось подключиться, проверьте адрес и ключ", newText: "Не удалось подключиться, проверьте адрес"},
+	}
+	for _, replacement := range replacements {
+		for _, quote := range []string{`"`, `'`, "`"} {
+			oldValue := replacement.key + ":" + quote + replacement.oldText + quote
+			newValue := replacement.key + ":" + quote + replacement.newText + quote
+			content = strings.ReplaceAll(content, oldValue, newValue)
+		}
+	}
+	return content
+}
+
+func pinnedManagementAsset(localPath string) bool {
+	_, err := os.Stat(localPath + managementPinnedMarkerSuffix)
 	return err == nil
 }
 
