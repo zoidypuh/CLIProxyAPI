@@ -71,6 +71,16 @@ force-model-prefix: false
 # Default is false (disabled).
 passthrough-headers: false
 
+# Optional fail-open Langfuse tracing for proxied model requests.
+# Credentials may be supplied here, via process env (LANGFUSE_* or HERMES_LANGFUSE_*),
+# or via env-file. Prefer env/env-file for secrets.
+langfuse:
+  enabled: false
+  base-url: "https://cloud.langfuse.com"
+  # env-file: "/path/to/.env"
+  environment: "local"
+  max-chars: 12000
+
 # Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
 request-retry: 3
 

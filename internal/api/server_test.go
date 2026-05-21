@@ -12,7 +12,7 @@ import (
 
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -233,9 +233,11 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 	}
 
 	logger := defaultRequestLoggerFactory(cfg, configPath)
-	fileLogger, ok := logger.(*internallogging.FileRequestLogger)
+	fileLogger, ok := logger.(interface {
+		LogRequestWithOptions(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
+	})
 	if !ok {
-		t.Fatalf("expected *FileRequestLogger, got %T", logger)
+		t.Fatalf("expected logger with LogRequestWithOptions, got %T", logger)
 	}
 
 	errLog := fileLogger.LogRequestWithOptions(

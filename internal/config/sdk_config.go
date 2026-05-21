@@ -31,6 +31,9 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// Langfuse configures optional fail-open request tracing to Langfuse.
+	Langfuse LangfuseConfig `yaml:"langfuse" json:"langfuse"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
@@ -44,6 +47,33 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// LangfuseConfig controls optional proxy-level Langfuse tracing.
+type LangfuseConfig struct {
+	// Enabled toggles Langfuse tracing. Credentials may come from this config
+	// or from LANGFUSE_*/HERMES_LANGFUSE_* environment variables.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// BaseURL is the Langfuse server URL. Defaults to LANGFUSE_HOST,
+	// LANGFUSE_BASE_URL, HERMES_LANGFUSE_BASE_URL, or https://cloud.langfuse.com.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// EnvFile optionally points at an env file to read Langfuse credentials
+	// from. Process environment still wins over this file.
+	EnvFile string `yaml:"env-file" json:"env-file"`
+
+	// PublicKey and SecretKey are optional direct credentials. Prefer env vars
+	// for local configs that may be committed or shared.
+	PublicKey string `yaml:"public-key" json:"-"`
+	SecretKey string `yaml:"secret-key" json:"-"`
+
+	// Environment and Release are attached to Langfuse traces when set.
+	Environment string `yaml:"environment" json:"environment"`
+	Release     string `yaml:"release" json:"release"`
+
+	// MaxChars limits string fields sent to Langfuse. Defaults to 12000.
+	MaxChars int `yaml:"max-chars" json:"max-chars"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.
