@@ -1,13 +1,17 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
@@ -66,6 +70,52 @@ func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
 			t.Fatalf("remaining queue = %q, want original item", remaining)
 		}
 	})
+}
+
+func TestStreamRequestLifecycleEventsEmitsRequestSSE(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/request-events", nil).WithContext(ctx)
+
+	done := make(chan struct{})
+	h := &Handler{}
+	go func() {
+		h.StreamRequestLifecycleEvents(ginCtx)
+		close(done)
+	}()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(time.Second)
+	for {
+		usage.PublishRequestLifecycleEvent(usage.RequestLifecycleEvent{
+			Event:     usage.RequestLifecycleStarted,
+			RequestID: "abc12345",
+			Model:     "gpt-5.5",
+		})
+		body := rec.Body.String()
+		if strings.Contains(body, "event:request") &&
+			strings.Contains(body, "request.started") &&
+			strings.Contains(body, "abc12345") {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("stream handler did not exit after request context cancellation")
+			}
+			return
+		}
+
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			cancel()
+			t.Fatalf("request lifecycle SSE was not emitted; body=%q", rec.Body.String())
+		}
+	}
 }
 
 func withManagementUsageQueue(t *testing.T, fn func()) {

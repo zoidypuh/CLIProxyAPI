@@ -51,6 +51,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		publishRequestStartedLifecycleEvent(c, requestInfo)
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)

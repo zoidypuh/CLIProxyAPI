@@ -3,9 +3,11 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
@@ -73,6 +75,63 @@ func (h *Handler) StreamUsageEvents(c *gin.Context) {
 			}
 		}
 	}
+}
+
+// StreamRequestLifecycleEvents streams live request start/end events as server-sent events.
+func (h *Handler) StreamRequestLifecycleEvents(c *gin.Context) {
+	events, unsubscribe := usage.SubscribeRequestLifecycleEvents(512)
+	defer unsubscribe()
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	flusher, _ := c.Writer.(http.Flusher)
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	ctx := c.Request.Context()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			c.SSEvent("request", event)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case <-heartbeat.C:
+			if _, err := c.Writer.Write([]byte(": keep-alive\n\n")); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// GetUsageQueue pops queued usage records for local consumers that bridge metrics elsewhere.
+func (h *Handler) GetUsageQueue(c *gin.Context) {
+	countValue := c.DefaultQuery("count", "100")
+	count, err := strconv.Atoi(countValue)
+	if err != nil || count <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "count must be positive"})
+		return
+	}
+	records := redisqueue.PopOldest(count)
+	payload := make([]json.RawMessage, 0, len(records))
+	for _, record := range records {
+		if len(record) == 0 {
+			continue
+		}
+		payload = append(payload, json.RawMessage(record))
+	}
+	c.JSON(http.StatusOK, payload)
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

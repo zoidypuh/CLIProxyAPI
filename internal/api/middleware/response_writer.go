@@ -5,6 +5,7 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -282,6 +284,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
 	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
 	if !w.logger.IsEnabled() && !forceLog {
+		publishRequestCompletedLifecycleEvent(c, w.requestInfo, finalStatusCode, lifecycleTokens(w.extractResponseBody(c), w.extractAPIResponse(c)))
 		return nil
 	}
 
@@ -313,13 +316,99 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 		if err := w.streamWriter.Close(); err != nil {
 			w.streamWriter = nil
+			publishRequestCompletedLifecycleEvent(c, w.requestInfo, finalStatusCode, lifecycleTokens(w.extractResponseBody(c), apiResponse))
 			return err
 		}
 		w.streamWriter = nil
+		publishRequestCompletedLifecycleEvent(c, w.requestInfo, finalStatusCode, lifecycleTokens(w.extractResponseBody(c), apiResponse))
 		return nil
 	}
 
+	publishRequestCompletedLifecycleEvent(c, w.requestInfo, finalStatusCode, lifecycleTokens(w.extractResponseBody(c), w.extractAPIResponse(c)))
 	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractWebsocketTimeline(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIWebsocketTimeline(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+}
+
+func lifecycleTokens(bodies ...[]byte) *usage.TokenStats {
+	for _, body := range bodies {
+		if tokens, ok := parseLifecycleTokens(body); ok {
+			return &tokens
+		}
+	}
+	return nil
+}
+
+func parseLifecycleTokens(body []byte) (usage.TokenStats, bool) {
+	var tokens usage.TokenStats
+	if len(bytes.TrimSpace(body)) == 0 {
+		return tokens, false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return tokens, false
+	}
+	if usageValue, ok := payload["usage"].(map[string]any); ok {
+		if hasAnyField(usageValue, "prompt_tokens", "completion_tokens", "total_tokens") {
+			tokens.InputTokens = firstInt64Field(usageValue, "prompt_tokens", "input_tokens")
+			tokens.OutputTokens = firstInt64Field(usageValue, "completion_tokens", "output_tokens")
+			tokens.TotalTokens = firstInt64Field(usageValue, "total_tokens")
+			if details, okDetails := usageValue["prompt_tokens_details"].(map[string]any); okDetails {
+				tokens.CachedTokens = firstInt64Field(details, "cached_tokens")
+			}
+			if details, okDetails := usageValue["completion_tokens_details"].(map[string]any); okDetails {
+				tokens.ReasoningTokens = firstInt64Field(details, "reasoning_tokens")
+			}
+			if tokens.TotalTokens == 0 && (tokens.InputTokens > 0 || tokens.OutputTokens > 0) {
+				tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens
+			}
+			return tokens, true
+		}
+		if hasAnyField(usageValue, "input_tokens", "output_tokens") {
+			tokens.InputTokens = firstInt64Field(usageValue, "input_tokens")
+			tokens.OutputTokens = firstInt64Field(usageValue, "output_tokens")
+			tokens.TotalTokens = firstInt64Field(usageValue, "total_tokens")
+			tokens.CachedTokens = firstInt64Field(usageValue, "cache_read_input_tokens", "cache_creation_input_tokens")
+			if details, okDetails := usageValue["input_tokens_details"].(map[string]any); okDetails && tokens.CachedTokens == 0 {
+				tokens.CachedTokens = firstInt64Field(details, "cached_tokens")
+			}
+			if details, okDetails := usageValue["output_tokens_details"].(map[string]any); okDetails {
+				tokens.ReasoningTokens = firstInt64Field(details, "reasoning_tokens")
+			}
+			if tokens.TotalTokens == 0 && (tokens.InputTokens > 0 || tokens.OutputTokens > 0) {
+				tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens
+			}
+			return tokens, true
+		}
+	}
+	if usageMetadata, ok := firstMapField(payload, "usageMetadata", "usage_metadata"); ok {
+		tokens.InputTokens = firstInt64Field(usageMetadata, "promptTokenCount", "prompt_token_count", "inputTokenCount")
+		tokens.OutputTokens = firstInt64Field(usageMetadata, "candidatesTokenCount", "candidates_token_count", "outputTokenCount")
+		tokens.TotalTokens = firstInt64Field(usageMetadata, "totalTokenCount", "total_token_count")
+		tokens.CachedTokens = firstInt64Field(usageMetadata, "cachedContentTokenCount", "cached_content_token_count")
+		tokens.ReasoningTokens = firstInt64Field(usageMetadata, "thoughtsTokenCount", "thoughts_token_count")
+		if tokens.TotalTokens == 0 && (tokens.InputTokens > 0 || tokens.OutputTokens > 0) {
+			tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens
+		}
+		return tokens, tokens.InputTokens > 0 || tokens.OutputTokens > 0 || tokens.TotalTokens > 0
+	}
+	return tokens, false
+}
+
+func firstMapField(payload map[string]any, keys ...string) (map[string]any, bool) {
+	for _, key := range keys {
+		if value, ok := payload[key].(map[string]any); ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func hasAnyField(payload map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := payload[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
