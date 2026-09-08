@@ -82,7 +82,7 @@ func GetAntigravityModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+	return upsertModelInfos(models, codexBuiltinImageModelInfo(), codexBuiltinImage25SunburstModelInfo(), codexBuiltinImage25FlareModelInfo())
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -94,6 +94,30 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func codexBuiltinImage25SunburstModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          "gpt-image-2.5-sunburst",
+		Object:      "model",
+		Created:     1788825600, // 2026-09-08
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5 Sunburst",
+		Version:     "gpt-image-2.5-sunburst",
+	}
+}
+
+func codexBuiltinImage25FlareModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          "gpt-image-2.5-flare",
+		Object:      "model",
+		Created:     1788825600, // 2026-09-08
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5 Flare",
+		Version:     "gpt-image-2.5-flare",
 	}
 }
 
