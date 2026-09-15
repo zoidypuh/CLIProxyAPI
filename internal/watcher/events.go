@@ -89,6 +89,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	}
 
 	// Handle auth directory changes incrementally (.json only)
+	w.authRescanMu.Lock()
+	defer w.authRescanMu.Unlock()
+	w.observeAuthFile(event.Name)
+
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {
 			log.Debugf("debouncing remove event for %s", filepath.Base(event.Name))
@@ -103,7 +107,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 				return
 			}
 			log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-			w.addOrUpdateClient(event.Name)
+			w.addOrUpdateClientLocked(event.Name)
 			return
 		}
 		if !w.isKnownAuthFile(event.Name) {
@@ -111,7 +115,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			return
 		}
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.removeClient(event.Name)
+		w.removeClientLocked(event.Name)
 		return
 	}
 	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
@@ -120,7 +124,29 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			return
 		}
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.addOrUpdateClient(event.Name)
+		w.addOrUpdateClientLocked(event.Name)
+	}
+}
+
+// observeAuthFile invalidates in-flight scans even if hash or content deduplication
+// suppresses an update. It must not invalidate an otherwise valid queued auth event.
+func (w *Watcher) observeAuthFile(path string) {
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" {
+		return
+	}
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	if w.fileObservations == nil {
+		w.fileObservations = make(map[string]uint64)
+	}
+	w.fileObservations[normalized]++
+	if w.activeAuthScans > 0 {
+		// A reload may cache a hash before publishing its auth. Force the event
+		// to parse it even if the scan finishes first, retaining the known path.
+		if _, known := w.lastAuthHashes[normalized]; known {
+			w.lastAuthHashes[normalized] = ""
+		}
 	}
 }
 
