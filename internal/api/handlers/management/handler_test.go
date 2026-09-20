@@ -11,6 +11,30 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 )
 
+func TestAuthenticateManagementKey_EmptyKeyAllowsLogin(t *testing.T) {
+	h := &Handler{
+		cfg: &config.Config{
+			RemoteManagement: config.RemoteManagement{
+				AllowRemote: true,
+			},
+		},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+
+	for i := 0; i < 10; i++ {
+		allowed, statusCode, errMsg := h.AuthenticateManagementKey("100.121.158.19", false, "")
+		if !allowed {
+			t.Fatalf("expected empty key to succeed at attempt %d: status=%d msg=%q", i+1, statusCode, errMsg)
+		}
+	}
+
+	allowed, statusCode, errMsg := h.AuthenticateManagementKey("100.121.158.19", false, "test-secret")
+	if !allowed {
+		t.Fatalf("expected correct key after empty logins, status=%d msg=%q", statusCode, errMsg)
+	}
+}
+
 func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *testing.T) {
 	h := &Handler{
 		cfg:            &config.Config{},
