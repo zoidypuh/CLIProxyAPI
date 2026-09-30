@@ -338,8 +338,13 @@ func (s *Service) registerOpenAICompatProviderExecutor(providerKey string, auth 
 	if providerKey == "" {
 		providerKey = "openai-compatibility"
 	}
-	compatExecutor := executor.NewOpenAICompatExecutor(providerKey, cfg)
-	nextExecutor := s.wrapOpenAICompatIfPluginAuth(compatExecutor, auth, cfg)
+	var nextExecutor coreauth.ProviderExecutor
+	if executor.IsOpenRouterBatchProvider(providerKey) {
+		nextExecutor = executor.NewOpenRouterBatchExecutor(providerKey, cfg)
+	} else {
+		compatExecutor := executor.NewOpenAICompatExecutor(providerKey, cfg)
+		nextExecutor = s.wrapOpenAICompatIfPluginAuth(compatExecutor, auth, cfg)
+	}
 	if !forceReplace {
 		if existingExecutor, hasExecutor := s.coreManager.Executor(providerKey); hasExecutor {
 			if shouldKeepExistingOpenAICompatExecutor(s, existingExecutor, nextExecutor, respectNonOwned) {
@@ -390,6 +395,10 @@ func pluginAuthProviderLookupKeys(auth *coreauth.Auth, fallback string) []string
 func shouldKeepExistingOpenAICompatExecutor(s *Service, existing, next coreauth.ProviderExecutor, respectNonOwned bool) bool {
 	if existing == nil || next == nil {
 		return false
+	}
+	if _, batch := next.(*executor.OpenRouterBatchExecutor); batch {
+		_, already := existing.(*executor.OpenRouterBatchExecutor)
+		return already
 	}
 	if shouldUpgradeOpenAICompatToPluginRefresh(existing, next) {
 		return false
