@@ -269,3 +269,22 @@ func TestGetDevinModelsFallback(t *testing.T) {
 		t.Errorf("info.DisplayName = %q, want SWE-2", info.DisplayName)
 	}
 }
+
+func TestEmbeddedXAICatalogIncludesGrokImagineVideo(t *testing.T) {
+	for _, model := range getModels().XAI {
+		if model == nil || model.ID != xaiBuiltinVideoModelID {
+			continue
+		}
+		if model.OwnedBy != "xai" {
+			t.Fatalf("owned_by = %q, want xai", model.OwnedBy)
+		}
+		if model.Type != "xai" {
+			t.Fatalf("type = %q, want xai", model.Type)
+		}
+		if model.Object != "model" {
+			t.Fatalf("object = %q, want model", model.Object)
+		}
+		return
+	}
+	t.Fatalf("embedded xAI catalog missing %s", xaiBuiltinVideoModelID)
+}

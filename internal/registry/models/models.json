@@ -4034,6 +4034,23 @@
       "description": "xAI Composer 2.5 Fast model for the Responses API.",
       "context_length": 200000,
       "max_completion_tokens": 32768
+    },
+    {
+      "id": "grok-imagine-video",
+      "object": "model",
+      "created": 1735689600,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok Imagine Video",
+      "name": "grok-imagine-video",
+      "description": "xAI Grok video generation model.",
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "video"
+      ]
     }
   ],
   "meta": [
