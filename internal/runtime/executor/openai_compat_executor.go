@@ -165,7 +165,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	requestLog := helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -175,11 +175,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, requestLog)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoOpenAICompatRequest(httpClient, httpReq, baseModel, e.cfg, requestLog)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -380,7 +381,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	requestLog := helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -390,11 +391,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, requestLog)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoOpenAICompatRequest(httpClient, httpReq, baseModel, e.cfg, requestLog)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
