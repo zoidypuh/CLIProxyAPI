@@ -1094,3 +1094,56 @@ func TestXAIVideosNativeRejectsUnregisteredPrefixedModel(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
 }
+
+type videoSigningExecutor struct {
+	*videoAuthCaptureExecutor
+}
+
+func (e videoSigningExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	if auth != nil && auth.Attributes != nil {
+		req.Header.Set("Authorization", "Bearer "+auth.Attributes["api_key"])
+	}
+	return http.DefaultClient.Do(req.WithContext(ctx))
+}
+
+func TestVideosContentResolvesProviderRelativeURLWithAuth(t *testing.T) {
+	resetVideoAuthBindingsForTest(t)
+
+	videoID := "video-content-relative"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/videos/"+videoID+"/content" || r.Header.Get("Authorization") != "Bearer provider-key" {
+			http.Error(w, "unexpected request "+r.URL.Path, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("relative-video-bytes"))
+	}))
+	defer upstream.Close()
+
+	authID := "video-content-relative-auth"
+	capture := &videoAuthCaptureExecutor{requestID: videoID, contentURL: "/v1/videos/" + videoID + "/content"}
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(videoSigningExecutor{capture})
+	auth := &coreauth.Auth{
+		ID:         authID,
+		Provider:   "xai",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": upstream.URL + "/v1", "api_key": "provider-key"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("manager.Register() error = %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, auth.Provider, []*registry.ModelInfo{{ID: defaultXAIVideosModel}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	})
+
+	handler := NewOpenAIAPIHandler(apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	resp := performVideosRouteRequest(t, http.MethodGet, videosPath+"/:request_id/content", videosPath+"/"+videoID+"/content", "", nil, handler.VideosContent)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("content status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := resp.Body.String(); got != "relative-video-bytes" {
+		t.Fatalf("content body = %q, want relative-video-bytes", got)
+	}
+}
