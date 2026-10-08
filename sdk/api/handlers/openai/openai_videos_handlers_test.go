@@ -1052,3 +1052,45 @@ func videosCreateRequestFromFormContext(body string) ([]byte, error) {
 	router.ServeHTTP(resp, req)
 	return rawJSON, err
 }
+
+func TestXAIVideosNativeRoutesPrefixedProviderModel(t *testing.T) {
+	resetVideoAuthBindingsForTest(t)
+	executor := &videoAuthCaptureExecutor{requestID: "video-prefixed-provider"}
+	const prefixedModel = "fun/grok-imagine-video-1.5"
+	handler := newVideoSingleModelAuthTestHandler(t, executor, "video-prefixed-auth", prefixedModel)
+
+	createResp := performVideosEndpointRequest(t, http.MethodPost, xaiVideosGenerationsAPI, "application/json", strings.NewReader(`{"model":"fun/grok-imagine-video-1.5","prompt":"make a video"}`), handler.XAIVideosGenerations)
+	if createResp.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want %d: %s", createResp.Code, http.StatusOK, createResp.Body.String())
+	}
+	videoID := gjson.GetBytes(createResp.Body.Bytes(), "request_id").String()
+	if videoID != executor.requestID {
+		t.Fatalf("created request_id = %q, want %q", videoID, executor.requestID)
+	}
+
+	retrieveResp := performVideosRouteRequest(t, http.MethodGet, videosPath+"/:request_id", videosPath+"/"+videoID, "", nil, handler.XAIVideosRetrieve)
+	if retrieveResp.Code != http.StatusOK {
+		t.Fatalf("retrieve status = %d, want %d: %s", retrieveResp.Code, http.StatusOK, retrieveResp.Body.String())
+	}
+
+	authIDs := executor.AuthIDs()
+	if len(authIDs) != 2 || authIDs[0] != "video-prefixed-auth" || authIDs[1] != "video-prefixed-auth" {
+		t.Fatalf("authIDs = %v, want both calls on video-prefixed-auth", authIDs)
+	}
+	if payloadModels := executor.PayloadModels(); len(payloadModels) == 0 || payloadModels[0] != xaiVideos15Model {
+		t.Fatalf("payload models = %v, want create payload model %s", payloadModels, xaiVideos15Model)
+	}
+	if got := routingXAIVideosModel(prefixedModel); got != prefixedModel {
+		t.Fatalf("routing model = %q, want %q", got, prefixedModel)
+	}
+}
+
+func TestXAIVideosNativeRejectsUnregisteredPrefixedModel(t *testing.T) {
+	handler := &OpenAIAPIHandler{}
+	body := strings.NewReader(`{"model":"nope/grok-imagine-video-1.5","prompt":"make a video"}`)
+
+	resp := performVideosEndpointRequest(t, http.MethodPost, xaiVideosGenerationsAPI, "application/json", body, handler.XAIVideosGenerations)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}

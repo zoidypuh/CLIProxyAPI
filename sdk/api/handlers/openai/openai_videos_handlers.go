@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -146,15 +147,40 @@ func videosModelBase(model string) string {
 	return strings.ToLower(strings.TrimSpace(baseModel))
 }
 
-func isXAIVideosModel(model string) bool {
-	prefix, baseModel := imagesModelParts(model)
-	baseModel = strings.ToLower(strings.TrimSpace(baseModel))
-	if baseModel != defaultXAIVideosModel && baseModel != xaiVideos15Model && baseModel != xaiVideos15PreviewAlias {
+func isXAIVideosBaseModel(baseModel string) bool {
+	switch strings.ToLower(strings.TrimSpace(baseModel)) {
+	case defaultXAIVideosModel, xaiVideos15Model, xaiVideos15PreviewAlias:
+		return true
+	default:
 		return false
 	}
+}
 
-	prefix = strings.ToLower(strings.TrimSpace(prefix))
-	return prefix == "" || prefix == "xai" || prefix == "x-ai" || prefix == "grok"
+func isXAIVideosPrefix(prefix string) bool {
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "", "xai", "x-ai", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
+func isXAIVideosModel(model string) bool {
+	prefix, baseModel := imagesModelParts(model)
+	return isXAIVideosBaseModel(baseModel) && isXAIVideosPrefix(prefix)
+}
+
+// isPrefixedVideosModel reports whether model is a Grok video model exposed by a
+// configured provider under its own prefix (e.g. "fun/grok-imagine-video-1.5" from an
+// openai-compatibility entry with prefix "fun"). Such models keep their full ID for
+// routing so the auth manager selects that provider instead of the native xAI auths.
+func isPrefixedVideosModel(model string) bool {
+	model = strings.TrimSpace(model)
+	prefix, baseModel := imagesModelParts(model)
+	if isXAIVideosPrefix(prefix) || !isXAIVideosBaseModel(baseModel) {
+		return false
+	}
+	return registry.LookupModelInfo(model) != nil
 }
 
 func isSoraVideosModel(model string) bool {
@@ -181,7 +207,7 @@ func rejectUnsupportedVideosModel(c *gin.Context, model string) bool {
 }
 
 func rejectUnsupportedNativeVideosModel(c *gin.Context, model string) bool {
-	if isXAIVideosModel(model) {
+	if isXAIVideosModel(model) || isPrefixedVideosModel(model) {
 		return false
 	}
 
@@ -208,6 +234,9 @@ func canonicalXAIVideosModel(model string) string {
 }
 
 func routingXAIVideosModel(model string) string {
+	if isPrefixedVideosModel(model) {
+		return strings.TrimSpace(model)
+	}
 	if isSoraVideosModel(model) {
 		return defaultXAIVideosModel
 	}
@@ -746,7 +775,13 @@ func (h *OpenAIAPIHandler) handleXAIVideosNativePost(c *gin.Context) {
 	}
 
 	routingModel := routingXAIVideosModel(videoModel)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "model", canonicalXAIVideosModel(videoModel))
+	payloadModel := canonicalXAIVideosModel(videoModel)
+	if isPrefixedVideosModel(videoModel) {
+		// The provider receives its own model name; the executor also overrides
+		// it with the resolved upstream model.
+		_, payloadModel = imagesModelParts(videoModel)
+	}
+	rawJSON, _ = sjson.SetBytes(rawJSON, "model", payloadModel)
 	h.collectXAIVideosNative(c, rawJSON, routingModel, true)
 }
 
