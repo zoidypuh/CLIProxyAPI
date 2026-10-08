@@ -697,7 +697,15 @@ func xaiVideoContentURLFromPayload(payload []byte) (string, error) {
 		return "", fmt.Errorf("xAI video response did not include video.url")
 	}
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+	if err != nil || parsed == nil {
+		return "", fmt.Errorf("xAI video response included invalid video.url")
+	}
+	// Some openai-compatibility providers return a provider-relative path such as
+	// /v1/videos/<id>/content; writeVideoContentFromURL resolves it on the bound provider.
+	if parsed.Scheme == "" && parsed.Host == "" && strings.HasPrefix(parsed.Path, "/") {
+		return rawURL, nil
+	}
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return "", fmt.Errorf("xAI video response included invalid video.url")
 	}
 	return rawURL, nil
@@ -856,7 +864,7 @@ func (h *OpenAIAPIHandler) VideosRetrieve(c *gin.Context) {
 }
 
 func (h *OpenAIAPIHandler) VideosContent(c *gin.Context) {
-	videoID := strings.TrimSpace(c.Param("video_id"))
+	videoID := videoIDParam(c)
 	if videoID == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
@@ -920,7 +928,40 @@ func (h *OpenAIAPIHandler) VideosContent(c *gin.Context) {
 	cliCancel(nil)
 }
 
+// videoIDParam returns the video ID from either the OpenAI-style (:video_id) or
+// the xAI-style (:request_id) route parameter.
+func videoIDParam(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if videoID := strings.TrimSpace(c.Param("video_id")); videoID != "" {
+		return videoID
+	}
+	return strings.TrimSpace(c.Param("request_id"))
+}
+
+// resolveVideoContentURL turns a provider-relative content URL (for example
+// "/v1/videos/<id>/content" returned by an openai-compatibility provider) into an
+// absolute URL on the bound provider. The returned auth signs the download because
+// such URLs need the provider credentials; absolute URLs are left untouched.
+func (h *OpenAIAPIHandler) resolveVideoContentURL(c *gin.Context, contentURL string) (string, *coreauth.Auth) {
+	parsed, errParse := url.Parse(strings.TrimSpace(contentURL))
+	if errParse != nil || parsed.IsAbs() || parsed.Host != "" {
+		return contentURL, nil
+	}
+	auth := h.videoContentDownloadAuth(c)
+	if auth == nil || auth.Attributes == nil {
+		return contentURL, nil
+	}
+	base, errBase := url.Parse(strings.TrimSpace(auth.Attributes["base_url"]))
+	if errBase != nil || base.Scheme == "" || base.Host == "" {
+		return contentURL, nil
+	}
+	return base.ResolveReference(parsed).String(), auth
+}
+
 func (h *OpenAIAPIHandler) writeVideoContentFromURL(c *gin.Context, contentURL string) error {
+	contentURL, signAuth := h.resolveVideoContentURL(c, contentURL)
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, contentURL, nil)
 	if err != nil {
 		errMsg := &interfaces.ErrorMessage{
@@ -931,8 +972,12 @@ func (h *OpenAIAPIHandler) writeVideoContentFromURL(c *gin.Context, contentURL s
 		return err
 	}
 
-	httpClient := h.videoContentHTTPClient(c)
-	resp, err := httpClient.Do(req)
+	var resp *http.Response
+	if signAuth != nil {
+		resp, err = h.AuthManager.HttpRequest(c.Request.Context(), signAuth, req)
+	} else {
+		resp, err = h.videoContentHTTPClient(c).Do(req)
+	}
 	if err != nil {
 		errMsg := &interfaces.ErrorMessage{
 			StatusCode: clienterror.HTTPStatusFromErrorOr(err, http.StatusBadGateway),
@@ -983,7 +1028,7 @@ func (h *OpenAIAPIHandler) videoContentDownloadAuth(c *gin.Context) *coreauth.Au
 	if h == nil || h.BaseAPIHandler == nil || h.AuthManager == nil || c == nil {
 		return nil
 	}
-	videoID := strings.TrimSpace(c.Param("video_id"))
+	videoID := videoIDParam(c)
 	if videoID == "" {
 		return nil
 	}
