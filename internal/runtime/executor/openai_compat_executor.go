@@ -235,7 +235,18 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		return resp, err
 	}
 
-	payload, contentType, errPrepare := prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+	var (
+		payload     []byte
+		contentType string
+		errPrepare  error
+	)
+	if isOpenRouterImagesBaseURL(baseURL) {
+		payload, errPrepare = prepareOpenRouterImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+		contentType = "application/json"
+		endpointPath = openRouterImagesPath
+	} else {
+		payload, contentType, errPrepare = prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+	}
 	if errPrepare != nil {
 		err = errPrepare
 		return resp, err
@@ -592,7 +603,18 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		return nil, err
 	}
 
-	payload, contentType, errPrepare := prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), true)
+	var (
+		payload     []byte
+		contentType string
+		errPrepare  error
+	)
+	if isOpenRouterImagesBaseURL(baseURL) {
+		payload, errPrepare = prepareOpenRouterImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), true)
+		contentType = "application/json"
+		endpointPath = openRouterImagesPath
+	} else {
+		payload, contentType, errPrepare = prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), true)
+	}
 	if errPrepare != nil {
 		err = errPrepare
 		return nil, err
