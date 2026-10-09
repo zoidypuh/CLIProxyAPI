@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -513,5 +514,23 @@ func TestSSEFrameAccumulatorKeepsMultipleFramesDistinct(t *testing.T) {
 	}
 	if string(frames[0]) != first || string(frames[1]) != second {
 		t.Fatalf("frames were overwritten during buffer compaction: %q", frames)
+	}
+}
+
+func TestImagesNonStreamingKeepAliveDoesNotCommitStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{NonStreamKeepAliveInterval: 1}, nil))
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
+	stop := h.startImagesNonStreamingKeepAlive(c, context.Background())
+	time.Sleep(1300 * time.Millisecond)
+	stop()
+	if c.Writer.Written() || recorder.Body.Len() != 0 {
+		t.Fatalf("images keep-alive must not commit the response (written=%v, body=%q)", c.Writer.Written(), recorder.Body.String())
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "rejected by the safety system"}})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
 	}
 }

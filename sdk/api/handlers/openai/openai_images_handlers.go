@@ -1175,7 +1175,7 @@ func (h *OpenAIAPIHandler) collectRoutedImages(c *gin.Context, imageReq []byte, 
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	stopKeepAlive := h.startImagesNonStreamingKeepAlive(c, cliCtx)
 
 	model := strings.TrimSpace(imageModel)
 	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
@@ -1453,7 +1453,7 @@ func (h *OpenAIAPIHandler) collectImagesWithModel(c *gin.Context, imageReq []byt
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	stopKeepAlive := h.startImagesNonStreamingKeepAlive(c, cliCtx)
 
 	model = strings.TrimSpace(model)
 	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
@@ -1597,7 +1597,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	stopKeepAlive := h.startImagesNonStreamingKeepAlive(c, cliCtx)
 
 	mainModel := strings.TrimSpace(gjson.GetBytes(responsesReq, "model").String())
 	if mainModel == "" {
@@ -2019,4 +2019,14 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			writeImagesStreamKeepAlive(c, flusher)
 		}
 	}
+}
+
+// startImagesNonStreamingKeepAlive intentionally does not emit the global non-stream
+// keep-alive blank lines for /v1/images/*. Those blank lines commit a 200 status before the
+// upstream result is known, so an upstream rejection (e.g. OpenAI's safety system via
+// OpenRouter answering 400 after ~100s) would reach clients as "200 + error JSON" and
+// image clients such as ComfyUI then report "No images returned" instead of the real
+// error. Image clients use long request timeouts, so the real status is preferred.
+func (h *OpenAIAPIHandler) startImagesNonStreamingKeepAlive(_ *gin.Context, _ context.Context) func() {
+	return func() {}
 }
