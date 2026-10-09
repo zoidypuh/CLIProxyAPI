@@ -879,6 +879,7 @@ func (e *OpenAICompatExecutor) executeVideos(ctx context.Context, auth *cliproxy
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		data = explainEmptyOpenAICompatVideoError(httpResp.StatusCode, httpResp.Header, data, payload)
 		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, data)
 		return resp, err
 	}

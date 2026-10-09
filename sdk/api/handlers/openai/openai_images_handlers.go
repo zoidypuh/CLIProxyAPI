@@ -2027,6 +2027,8 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 // OpenRouter answering 400 after ~100s) would reach clients as "200 + error JSON" and
 // image clients such as ComfyUI then report "No images returned" instead of the real
 // error. Image clients use long request timeouts, so the real status is preferred.
+// The /v1/videos/* handlers use it too: a rejected video job otherwise reached ComfyUI as
+// "200 + error JSON" and failed validation for a missing request_id.
 func (h *OpenAIAPIHandler) startImagesNonStreamingKeepAlive(_ *gin.Context, _ context.Context) func() {
 	return func() {}
 }
