@@ -83,6 +83,10 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	logXAIResolvedBaseURL(ctx, baseURL)
 
 	payload := normalizeXAIImageRefs(req.Payload)
+	if shrunk, note := shrinkXAIVideoPayload(payload); note != "" {
+		helps.LogWithRequestID(ctx).Infof("%s", note)
+		payload = shrunk
+	}
 	method := http.MethodPost
 	endpointPath := xaiVideosGenerationsPath
 	var body io.Reader = bytes.NewReader(payload)
