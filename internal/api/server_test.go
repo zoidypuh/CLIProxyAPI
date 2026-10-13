@@ -1576,7 +1576,10 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
 	server := newTestServer(t)
+	// Local: a missing management key is a successful login, so send a wrong
+	// key to reach the unauthorized response that still exposes the header.
 	req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
 	req.Header.Set("Origin", "http://127.0.0.1:5173")
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
@@ -1665,11 +1668,13 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	redisqueue.Enqueue([]byte(`{"id":1}`))
 	redisqueue.Enqueue([]byte(`{"id":2}`))
 
+	// Local: a missing key logs in, so a wrong key is what must be rejected.
 	missingKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
+	missingKeyReq.Header.Set("Authorization", "Bearer wrong-key")
 	missingKeyRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(missingKeyRR, missingKeyReq)
 	if missingKeyRR.Code != http.StatusUnauthorized {
-		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
+		t.Fatalf("wrong key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
 	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)

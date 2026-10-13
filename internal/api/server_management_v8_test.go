@@ -25,7 +25,8 @@ func TestManagementV8RoutesShareAccessControl(t *testing.T) {
 		want                      int
 	}{
 		{"authorized", true, false, true, 200},
-		{"missing key", true, false, false, 401},
+		// Local: a missing management key is treated as a successful login.
+		{"missing key", true, false, false, 200},
 		{"disabled", false, false, true, 404},
 		{"home", true, true, true, 404},
 	} {

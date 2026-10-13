@@ -16,10 +16,14 @@ func TestDevinOAuthRoutes(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 	server := newTestServer(t)
 
+	// Local: an empty management key is a successful login, so this route
+	// answers without a bearer token. A wrong key still must be rejected.
 	w := httptest.NewRecorder()
-	server.engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/management/devin-auth-url", nil))
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/devin-auth-url", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	server.engine.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("unprotected login route: %d", w.Code)
+		t.Fatalf("wrong-key login route: %d", w.Code)
 	}
 	registered := false
 	for _, route := range server.engine.Routes() {
