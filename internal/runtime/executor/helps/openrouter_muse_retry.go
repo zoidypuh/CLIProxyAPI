@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 const openRouterMuseModel = "meta/muse-spark-1.3-contributor"

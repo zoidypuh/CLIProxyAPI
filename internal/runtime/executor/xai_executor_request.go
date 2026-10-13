@@ -10,19 +10,21 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 type xaiPreparedRequest struct {
+	finalizePayload       helps.PayloadFinalizer
+	applyPatch            *helps.ApplyPatchResponsesState
 	baseModel             string
 	from                  sdktranslator.Format
 	responseFormat        sdktranslator.Format
@@ -34,6 +36,7 @@ type xaiPreparedRequest struct {
 	sessionID             string
 	replayScope           xaiReasoningReplayScope
 	filterInternalXSearch bool
+	webSearchAlias        string
 }
 
 type xaiNamespaceToolRef struct {
@@ -68,20 +71,20 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibilityForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
 	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
-	body := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
+	body, updatesChanged, err := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntentForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
+	if err != nil {
+		return nil, err
+	}
 	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
-	var err error
-	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), e.Identifier(), e.Identifier())
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), e.Identifier(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return nil, err
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	finalizePayload := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -89,14 +92,30 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = helps.RewriteCodexMultiAgentV2Input(ctx, opts.Headers, body, e.cfg)
+	applyPatch := helps.NewApplyPatchResponsesState(from, originalPayload, originalTranslated)
+	var errNormalizePatch error
+	body, errNormalizePatch = helps.NormalizeApplyPatchResponsesRequest(body, originalPayload)
+	if errNormalizePatch != nil {
+		return nil, errNormalizePatch
+	}
 	willInjectXSearch := e.cfg != nil && e.cfg.XAI.InjectXSearch
 	shouldFold := xaiShouldFoldNamespaceTools(body, willInjectXSearch)
 	namespaceTools := collectXAINamespaceToolRefsWithFold(body, shouldFold)
+	for name, ref := range namespaceTools {
+		if ref.isDispatcher {
+			applyPatch.AddDispatcher(name, ref.namespace)
+		}
+	}
 	// Collect before normalizeXAITools flattens namespace wrappers so keys match
 	// the post-restore (namespace, short-name) shape used by the response filter.
 	clientDeclaredTools := collectXAIClientDeclaredToolKeys(body)
 	body = normalizeXAIToolsWithFold(body, shouldFold)
 	body = promoteXAIAdditionalTools(body)
+	var webSearchAlias string
+	if xaiHasClientWebSearchFunction(body, namespaceTools) {
+		webSearchAlias = xaiResolveClientWebSearchAlias(body)
+		body = aliasXAIClientWebSearchFunction(body, webSearchAlias, namespaceTools)
+	}
 	// Drop choices that point at tools removed by normalizeXAITools before any
 	// configured x_search injection, so no surviving choice references a deleted tool.
 	body = normalizeXAINamespaceToolChoiceWithFold(body, shouldFold)
@@ -120,10 +139,15 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	}
 	body = normalizeXAIInputCustomToolCalls(body)
 	body = normalizeXAIInputNamespaceToolCallsWithFold(body, shouldFold)
+	if webSearchAlias != "" {
+		body = aliasXAIClientWebSearchInput(body, webSearchAlias, namespaceTools)
+	}
 	body = normalizeXAIInputReasoningItems(body)
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
-	body = sanitizeXAIResponsesBody(body, baseModel)
+	// stop is supported by Chat Completions but not by xAI's Responses API.
+	// Thinking was handled before payload overrides and must not be revalidated here.
+	body, _ = sjson.DeleteBytes(body, "stop")
 	body = normalizeXAIImageRefs(body)
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
@@ -135,6 +159,8 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	}
 
 	return &xaiPreparedRequest{
+		finalizePayload:       finalizePayload,
+		applyPatch:            applyPatch,
 		baseModel:             baseModel,
 		from:                  from,
 		responseFormat:        responseFormat,
@@ -146,6 +172,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		sessionID:             sessionID,
 		replayScope:           replayScope,
 		filterInternalXSearch: xaiRequestHasNativeXSearch(body),
+		webSearchAlias:        webSearchAlias,
 	}, nil
 }
 
@@ -228,9 +255,9 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 // is false (including its OAuth default), empty or official default base_url is
 // rewritten to the CLI chat-proxy endpoint; an explicit non-default base_url is
 // still honored.
-// Websocket and compact transports intentionally do not use this helper:
-// cli-chat-proxy does not implement /responses/compact (404) or websocket
-// upgrades (405).
+// Websocket, compact, and speech intentionally do not use this helper:
+// cli-chat-proxy does not implement /responses/compact (404), websocket
+// upgrades (405), or /tts. Speech uses xaiSpeechRequestURL.
 func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
 	_, baseURL := xaiCreds(auth)
 	if xaiUsingAPI(auth) {
@@ -329,9 +356,10 @@ func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string,
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
 	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
+		clientVer := xaiClientVersion()
 		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
-		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
+		r.Header.Set(xaiClientVersionHeader, clientVer)
+		r.Header.Set("User-Agent", "xai-grok-workspace/"+clientVer)
 		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
 		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
 	}
@@ -477,6 +505,16 @@ func normalizeXAIImageRef(value any) bool {
 
 func xaiIsVideoRequest(opts cliproxyexecutor.Options) bool {
 	return opts.SourceFormat.String() == xaiVideoHandlerType
+}
+
+func xaiIsSpeechRequest(opts cliproxyexecutor.Options) bool {
+	return opts.SourceFormat.String() == xaiSpeechHandlerType
+}
+
+// xaiSpeechRequestURL stays on the official API. cli-chat-proxy does not implement /tts,
+// and a 404 there would cool the OAuth auth down as not_found.
+func xaiSpeechRequestURL(auth *cliproxyauth.Auth) string {
+	return strings.TrimSuffix(xaiCompactBaseURL(auth), "/") + xaiTTSPath
 }
 
 func xaiVideoEndpointPath(opts cliproxyexecutor.Options) string {
@@ -625,21 +663,6 @@ func xaiCompareGrokVersion(a, b xaiGrokVersion) int {
 	return 0
 }
 
-func sanitizeXAIResponsesBody(body []byte, model string) []byte {
-	// stop is supported by Chat Completions but not by xAI's Responses API.
-	body, _ = sjson.DeleteBytes(body, "stop")
-	if !xaiSupportsReasoningEffort(model) {
-		if gjson.GetBytes(body, "reasoning.effort").Exists() {
-			log.Debugf("xai: stripping reasoning.effort for model %s (no thinking levels in model registry)", model)
-		}
-		body, _ = sjson.DeleteBytes(body, "reasoning.effort")
-		if reasoning := gjson.GetBytes(body, "reasoning"); reasoning.Exists() && reasoning.IsObject() && len(reasoning.Map()) == 0 {
-			body, _ = sjson.DeleteBytes(body, "reasoning")
-		}
-	}
-	return body
-}
-
 // ensureXAINativeXSearchTool appends {"type":"x_search"} when the final tools
 // list does not already include native X Search. When tool_choice restricts the
 // model to allowed_tools, x_search is also added there (without duplicates) so
@@ -680,6 +703,163 @@ func ensureXAINativeXSearchAllowedTools(body []byte) []byte {
 	}
 	body, _ = sjson.SetRawBytes(body, "tool_choice.tools.-1", xaiXSearchToolJSON)
 	return body
+}
+
+// xaiHasClientWebSearchFunction reports whether body declares a client function
+// or custom tool named "web_search" (without namespace), excluding folded namespace dispatchers.
+func xaiHasClientWebSearchFunction(body []byte, namespaceTools map[string]xaiNamespaceToolRef) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		name := strings.TrimSpace(tool.Get("name").String())
+		if (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) && name == xaiWebSearchToolType {
+			if _, isNamespace := namespaceTools[name]; isNamespace {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// xaiBodyHasToolNamed reports whether any tool in tools or input has the given name.
+func xaiBodyHasToolNamed(body []byte, name string) bool {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("name").String()) == name {
+				return true
+			}
+			if nested := tool.Get("tools"); nested.IsArray() {
+				for _, child := range nested.Array() {
+					if strings.TrimSpace(child.Get("name").String()) == name {
+						return true
+					}
+				}
+			}
+		}
+	}
+	input := gjson.GetBytes(body, "input")
+	if input.IsArray() {
+		for _, item := range input.Array() {
+			if strings.TrimSpace(item.Get("name").String()) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// xaiResolveClientWebSearchAlias picks a candidate alias that does not collide
+// with any client tool already present in the request.
+func xaiResolveClientWebSearchAlias(body []byte) string {
+	candidate := xaiClientWebSearchAlias
+	if !xaiBodyHasToolNamed(body, candidate) {
+		return candidate
+	}
+	for i := 1; ; i++ {
+		next := fmt.Sprintf("%s_%d", xaiClientWebSearchAlias, i)
+		if !xaiBodyHasToolNamed(body, next) {
+			return next
+		}
+	}
+}
+
+// aliasXAIClientWebSearchInput renames client-declared function calls named
+// "web_search" to alias in replayed input history.
+func aliasXAIClientWebSearchInput(body []byte, alias string, namespaceTools map[string]xaiNamespaceToolRef) []byte {
+	if !gjson.ValidBytes(body) || alias == "" {
+		return body
+	}
+	if _, isNamespace := namespaceTools[xaiWebSearchToolType]; isNamespace {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+	for idx, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		itemName := strings.TrimSpace(item.Get("name").String())
+		itemNamespace := strings.TrimSpace(item.Get("namespace").String())
+		if (itemType == "function_call" || itemType == "custom_tool_call" || itemType == "function_call_output") &&
+			itemName == xaiWebSearchToolType && itemNamespace == "" {
+			body, _ = sjson.SetBytes(body, fmt.Sprintf("input.%d.name", idx), alias)
+		}
+	}
+	return body
+}
+
+// aliasXAIClientWebSearchFunction renames client-declared function tools named
+// "web_search" to a non-colliding alias in tools declarations, tool_choice,
+// and replayed input history to prevent xAI from hijacking them into hosted
+// server-side search. Namespace dispatcher tools named "web_search" are untouched.
+func aliasXAIClientWebSearchFunction(body []byte, alias string, namespaceTools map[string]xaiNamespaceToolRef) []byte {
+	if !gjson.ValidBytes(body) || alias == "" {
+		return body
+	}
+	// 1. Alias in tools (excluding namespace dispatchers)
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for idx, tool := range tools.Array() {
+			toolType := strings.TrimSpace(tool.Get("type").String())
+			name := strings.TrimSpace(tool.Get("name").String())
+			if (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) && name == xaiWebSearchToolType {
+				if _, isNamespace := namespaceTools[name]; isNamespace {
+					continue
+				}
+				body, _ = sjson.SetBytes(body, fmt.Sprintf("tools.%d.name", idx), alias)
+			}
+		}
+	}
+
+	// 2. Alias in tool_choice (only when unnamespaced and not a namespace dispatcher)
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.IsObject() {
+		if fnName := choice.Get("function.name"); fnName.Exists() && strings.TrimSpace(fnName.String()) == xaiWebSearchToolType {
+			if strings.TrimSpace(choice.Get("function.namespace").String()) == "" {
+				if _, isNamespace := namespaceTools[xaiWebSearchToolType]; !isNamespace {
+					body, _ = sjson.SetBytes(body, "tool_choice.function.name", alias)
+				}
+			}
+		}
+		if name := choice.Get("name"); name.Exists() && strings.TrimSpace(name.String()) == xaiWebSearchToolType {
+			if strings.TrimSpace(choice.Get("namespace").String()) == "" {
+				choiceType := strings.TrimSpace(choice.Get("type").String())
+				if choiceType == xaiFunctionToolType || choiceType == "tool" {
+					if _, isNamespace := namespaceTools[xaiWebSearchToolType]; !isNamespace {
+						body, _ = sjson.SetBytes(body, "tool_choice.name", alias)
+					}
+				}
+			}
+		}
+		if allowed := choice.Get("tools"); allowed.IsArray() {
+			for idx, allowedTool := range allowed.Array() {
+				if strings.TrimSpace(allowedTool.Get("namespace").String()) != "" {
+					continue
+				}
+				if _, isNamespace := namespaceTools[xaiWebSearchToolType]; isNamespace {
+					continue
+				}
+				allowedType := strings.TrimSpace(allowedTool.Get("type").String())
+				allowedName := strings.TrimSpace(allowedTool.Get("name").String())
+				if (allowedType == xaiFunctionToolType || allowedType == "tool") && allowedName == xaiWebSearchToolType {
+					body, _ = sjson.SetBytes(body, fmt.Sprintf("tool_choice.tools.%d.name", idx), alias)
+				} else if allowedName == xaiWebSearchToolType && allowedType != xaiWebSearchToolType {
+					body, _ = sjson.SetBytes(body, fmt.Sprintf("tool_choice.tools.%d.name", idx), alias)
+				}
+			}
+		}
+	}
+
+	// 3. Alias in input (conversation history, only when unnamespaced)
+	return aliasXAIClientWebSearchInput(body, alias, namespaceTools)
 }
 
 // normalizeXAIForcedWebSearchToolChoice rewrites web_search choices into a
@@ -1398,9 +1578,6 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 		return nil, true, true
 	}
 	if toolType == xaiImageGenerationToolType && !keepImageGeneration {
-		return nil, true, true
-	}
-	if toolType == xaiCustomToolType && tool.Get("name").String() == "apply_patch" {
 		return nil, true, true
 	}
 
