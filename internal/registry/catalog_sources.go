@@ -172,6 +172,7 @@ func publishCatalogBytes(data []byte) ([]string, error) {
 		parsed.Meta = old.Meta
 	}
 	changed := detectChangedProviders(old, &parsed)
+	ensureMetaSupplementalModels(&parsed)
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &parsed
 	modelsCatalogStore.mu.Unlock()
