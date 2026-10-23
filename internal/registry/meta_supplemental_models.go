@@ -39,6 +39,18 @@ const metaSupplementalModelsJSON = `[
     "thinking": {"levels": ["minimal", "low", "medium", "high", "xhigh", "max"]},
     "supportedInputModalities": ["text", "image", "video", "audio"],
     "supportedOutputModalities": ["text"]
+  },
+  {
+    "id": "muse-image-1.0",
+    "object": "model",
+    "created": 1792627200,
+    "owned_by": "meta",
+    "type": "openai-image",
+    "display_name": "Muse Image 1.0",
+    "name": "muse-image-1.0",
+    "description": "Meta Muse image generation model. Callable on /v1/images/generations.",
+    "supportedInputModalities": ["text"],
+    "supportedOutputModalities": ["image"]
   }
 ]`
 
