@@ -21,6 +21,9 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	if endpointPath := metaImageEndpointPath(opts); endpointPath != "" {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "meta image models do not support streaming"}
+	}
 
 	enriched, errAuth := e.ensureAuth(ctx, auth)
 	if errAuth != nil {

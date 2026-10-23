@@ -92,6 +92,9 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	if endpointPath := metaImageEndpointPath(opts); endpointPath != "" {
+		return e.executeImages(ctx, auth, req, opts, endpointPath)
+	}
 
 	enriched, errAuth := e.ensureAuth(ctx, auth)
 	if errAuth != nil {

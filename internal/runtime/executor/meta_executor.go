@@ -26,6 +26,14 @@ var metaRefreshGroup singleflight.Group
 
 const metaUserAgent = "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)"
 
+const (
+	metaImageHandlerType        = "openai-image"
+	metaImagesGenerationsPath   = "/images/generations"
+	metaImagesEditsPath         = "/images/edits"
+	metaDefaultImageEndpoint    = metaImagesGenerationsPath
+	metaImageModelID            = "muse-image-1.0"
+)
+
 // MetaExecutor implements the cliproxyauth.ProviderExecutor for Meta Muse models (api.meta.ai).
 type MetaExecutor struct {
 	cfg *config.Config

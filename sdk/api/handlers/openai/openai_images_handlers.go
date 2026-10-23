@@ -33,6 +33,7 @@ const (
 	gptImage25SunburstModel     = "gpt-image-2.5-sunburst"
 	gptImage25Model             = "gpt-image-2.5"
 	defaultXAIImagesModel       = "grok-imagine-image"
+	metaImagesModel             = "muse-image-1.0"
 	xaiImagesQualityModel       = "grok-imagine-image-quality"
 	xaiImages20Model            = "grok-imagine-image-2.0"
 	xaiImagesHandlerType        = "openai-image"
@@ -240,11 +241,20 @@ func isXAIImagesModel(model string) bool {
 	return prefix == "" || prefix == "xai" || prefix == "x-ai" || prefix == "grok"
 }
 
+func isMetaImagesModel(model string) bool {
+	prefix, baseModel := imagesModelParts(model)
+	if !strings.EqualFold(strings.TrimSpace(baseModel), metaImagesModel) {
+		return false
+	}
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	return prefix == "" || prefix == "meta"
+}
+
 func isSupportedImagesModel(model string) bool {
 	if isCodexImagesToolModel(model) {
 		return true
 	}
-	return isXAIImagesModel(model) || isOpenAICompatImagesModel(model)
+	return isXAIImagesModel(model) || isMetaImagesModel(model) || isOpenAICompatImagesModel(model)
 }
 
 func isCodexImagesToolModel(model string) bool {
@@ -272,7 +282,7 @@ func rejectUnsupportedImagesModel(c *gin.Context, model string) bool {
 
 	c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 		Error: handlers.ErrorDetail{
-			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, %s, %s, %s, %s, %s, or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, gptImage15Model, defaultImagesToolModel, gptImage25FlareModel, gptImage25SunburstModel, gptImage25Model, defaultXAIImagesModel, xaiImagesQualityModel, xaiImages20Model),
+			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, %s, %s, %s, %s, %s, %s, or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, gptImage15Model, defaultImagesToolModel, gptImage25FlareModel, gptImage25SunburstModel, gptImage25Model, defaultXAIImagesModel, xaiImagesQualityModel, xaiImages20Model, metaImagesModel),
 			Type:    "invalid_request_error",
 		},
 	})
@@ -686,6 +696,11 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		h.handleXAIImages(c, xaiReq, responseFormat, "image_generation", stream)
 		return
 	}
+	if isMetaImagesModel(imageModel) {
+		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, metaImagesModel, stream)
+		h.handleRoutedImages(c, imageReq, metaImagesModel, stream)
+		return
+	}
 	if isOpenAICompatImagesModel(imageModel) {
 		compatReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleOpenAICompatImages(c, compatReq, imageModel, responseFormat, "image_generation", stream)
@@ -838,6 +853,21 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		h.handleRoutedImages(c, imageReq, imageModel, stream)
 		return
 	}
+	if isMetaImagesModel(imageModel) {
+		imageReq, contentType, errBuild := buildOpenAICompatImagesMultipartRequest(form, metaImagesModel, stream)
+		if errBuild != nil {
+			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: fmt.Sprintf("Invalid request: %v", errBuild),
+					Type:    "invalid_request_error",
+				},
+			})
+			return
+		}
+		c.Request.Header.Set("Content-Type", contentType)
+		h.handleRoutedImages(c, imageReq, metaImagesModel, stream)
+		return
+	}
 	if isXAIImagesModel(imageModel) {
 		aspectRatio := xaiImagesAspectRatio(c.PostForm("aspect_ratio"), "")
 		aspectRatio = xaiImagesAspectRatioFromSize(c.PostForm("size"), aspectRatio)
@@ -969,6 +999,11 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	if isCodexImagesToolModel(imageModel) {
 		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleRoutedImages(c, imageReq, imageModel, stream)
+		return
+	}
+	if isMetaImagesModel(imageModel) {
+		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, metaImagesModel, stream)
+		h.handleRoutedImages(c, imageReq, metaImagesModel, stream)
 		return
 	}
 	if isXAIImagesModel(imageModel) {

@@ -47,7 +47,7 @@ func assertUnsupportedImagesModelResponse(t *testing.T, resp *httptest.ResponseR
 	}
 
 	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
-	expectedMessage := "Model " + model + " is not supported on " + imagesGenerationsPath + " or " + imagesEditsPath + ". Use " + gptImage15Model + ", " + defaultImagesToolModel + ", " + gptImage25FlareModel + ", " + gptImage25SunburstModel + ", " + gptImage25Model + ", " + defaultXAIImagesModel + ", " + xaiImagesQualityModel + ", " + xaiImages20Model + ", or a configured openai-compatibility image model."
+	expectedMessage := "Model " + model + " is not supported on " + imagesGenerationsPath + " or " + imagesEditsPath + ". Use " + gptImage15Model + ", " + defaultImagesToolModel + ", " + gptImage25FlareModel + ", " + gptImage25SunburstModel + ", " + gptImage25Model + ", " + defaultXAIImagesModel + ", " + xaiImagesQualityModel + ", " + xaiImages20Model + ", " + metaImagesModel + ", or a configured openai-compatibility image model."
 	if message != expectedMessage {
 		t.Fatalf("error message = %q, want %q", message, expectedMessage)
 	}
@@ -74,6 +74,8 @@ func TestImagesModelValidationAllowsGPTImageAndXAIModels(t *testing.T) {
 		"xai/grok-imagine-image-quality",
 		"grok-imagine-image-2.0",
 		"xai/grok-imagine-image-2.0",
+		"muse-image-1.0",
+		"meta/muse-image-1.0",
 	} {
 		if !isSupportedImagesModel(model) {
 			t.Fatalf("expected %s to be supported", model)
