@@ -424,6 +424,9 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if e == nil || e.XAIExecutor == nil {
 		return nil, fmt.Errorf("xai websockets executor: executor is nil")
 	}
+	if err = helps.CheckXAIQuotaReserve(ctx, e.cfg, auth); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
